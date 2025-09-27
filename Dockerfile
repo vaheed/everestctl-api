@@ -1,77 +1,37 @@
-# syntax=docker/dockerfile:1
-FROM python:3.12-slim AS base
+FROM python:3.11-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-# Image includes:
-#  - tini (init)
-#  - kubectl (pinned/overrideable)
-#  - everestctl (latest by default or pinned via build-arg)
-
-# Install tini and helpful tools
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates tini curl \
-    && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      tini ca-certificates curl && \
+    rm -rf /var/lib/apt/lists/*
 
 # Install kubectl
-# Set KUBECTL_VERSION to a specific tag like v1.30.4 for reproducible builds
-ARG KUBECTL_VERSION=stable
-RUN set -eux; \
-    arch="$(dpkg --print-architecture)"; \
-    if [ "$KUBECTL_VERSION" = "stable" ]; then \
-      ver="$(curl -fsSL https://dl.k8s.io/release/stable.txt)"; \
-    else \
-      ver="$KUBECTL_VERSION"; \
-    fi; \
-    curl -fsSLo /usr/local/bin/kubectl "https://dl.k8s.io/release/${ver}/bin/linux/${arch}/kubectl"; \
-    chmod +x /usr/local/bin/kubectl; \
-    kubectl version --client=true --output=yaml >/dev/null 2>&1 || true
+ARG KUBECTL_VERSION=v1.29.6
+RUN curl -fsSLo /usr/local/bin/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl" \
+    && chmod +x /usr/local/bin/kubectl \
+    && /usr/local/bin/kubectl version --client --output=yaml || true
 
-# Install everestctl (Percona Everest CLI)
-# EVERESTCTL_VERSION accepts values like v0.11.0 or 'latest'
-ARG EVERESTCTL_VERSION=latest
-ARG EVERESTCTL_REPO=percona/everest
-ENV EVERESTCTL_REPO=${EVERESTCTL_REPO}
-RUN set -eux; \
-    arch="$(dpkg --print-architecture)"; \
-    case "$arch" in \
-      amd64) rel_arch="amd64" ;; \
-      arm64) rel_arch="arm64" ;; \
-      *) echo "unsupported arch: $arch"; exit 1 ;; \
-    esac; \
-    base="https://github.com/${EVERESTCTL_REPO}/releases"; \
-    if [ "$EVERESTCTL_VERSION" = "latest" ]; then \
-      url="$base/latest/download/everestctl-linux-$rel_arch"; \
-    else \
-      url="$base/download/$EVERESTCTL_VERSION/everestctl-linux-$rel_arch"; \
-    fi; \
-    echo "Downloading everestctl from: $url"; \
-    curl -fLSo /tmp/everestctl "$url"; \
-    install -m 0555 /tmp/everestctl /usr/local/bin/everestctl; \
-    rm -f /tmp/everestctl; \
-    /usr/local/bin/everestctl version >/dev/null 2>&1 || true
-
-# everestctl and kubectl are installed at /usr/local/bin
+# Install everestctl (override EVERESTCTL_URI at build time if needed)
+ARG EVERESTCTL_URI=https://github.com/percona/everest/releases/latest/download/everestctl-linux-amd64
+RUN curl -fsSLo /usr/local/bin/everestctl "$EVERESTCTL_URI" \
+    && chmod +x /usr/local/bin/everestctl \
+    && /usr/local/bin/everestctl help || true
 
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app.py gunicorn_conf.py entrypoint.sh ./
-RUN chmod +x entrypoint.sh
+COPY . .
 
-# Non-root user
-RUN addgroup --system app && adduser --system --ingroup app app && \
-    mkdir -p /data && chown -R app:app /data /app
-USER app
+RUN adduser --disabled-password --gecos '' appuser && \
+    mkdir -p /var/lib/everest/policy /var/lib/everest/data && \
+    chown -R appuser:appuser /var/lib/everest /app
 
-ENV EVERESTCTL_PATH=/usr/local/bin/everestctl \
-    RBAC_POLICY_PATH=/data/policy.csv \
-    DB_PATH=/data/audit.db \
-    METRICS_ENABLED=true \
-    KUBECONFIG=/data/kubeconfig
+USER appuser
 
-EXPOSE 8080
-ENTRYPOINT ["/usr/bin/tini","-g","--"]
-CMD ["./entrypoint.sh"]
+ENV KUBECONFIG=/data/kubeconfig
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["sh", "entrypoint.sh"]

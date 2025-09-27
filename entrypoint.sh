@@ -1,57 +1,33 @@
 #!/usr/bin/env sh
 set -eu
 
-# Fail fast on missing API key
-if [ -z "${API_KEY:-}" ]; then
-  echo "ERROR: API_KEY is not set"; exit 1
+if [ -z "${ADMIN_API_KEY:-}" ]; then
+  echo "ADMIN_API_KEY is required" >&2
+  exit 1
 fi
 
-EVERESTCTL_PATH="${EVERESTCTL_PATH:-/usr/local/bin/everestctl}"
-if [ "${SKIP_CLI_CHECK:-}" = "1" ] || [ "${SKIP_CLI_CHECK:-}" = "true" ]; then
-  echo "INFO: skipping everestctl check (SKIP_CLI_CHECK set)"
-else
-  if [ ! -x "$EVERESTCTL_PATH" ] && ! command -v "$EVERESTCTL_PATH" >/dev/null 2>&1; then
-    echo "ERROR: everestctl not found at $EVERESTCTL_PATH"; exit 1
-  fi
-  # Ensure kubeconfig is available. Auto-detect common locations if not provided via env.
-  if [ -z "${KUBECONFIG:-}" ]; then
-    if [ -r "/data/kubeconfig" ]; then
-      export KUBECONFIG="/data/kubeconfig"
-      echo "INFO: using kubeconfig at $KUBECONFIG"
-    elif [ -r "$HOME/.kube/config" ]; then
-      export KUBECONFIG="$HOME/.kube/config"
-      echo "INFO: using kubeconfig at $KUBECONFIG"
-    else
-      echo "ERROR: kubeconfig not found. Mount your kubeconfig or set KUBECONFIG"; exit 1
-    fi
-  fi
-  if [ ! -r "$KUBECONFIG" ]; then
-    echo "ERROR: kubeconfig not found or not readable at $KUBECONFIG"; exit 1
-  fi
+if ! command -v everestctl >/dev/null 2>&1; then
+  echo "everestctl binary not found in PATH" >&2
+  exit 1
 fi
 
-# Prepare data dir and files
-mkdir -p /data
-: "${RBAC_POLICY_PATH:=/data/policy.csv}"
-: "${DB_PATH:=/data/audit.db}"
-DB_URL=${DB_URL:-}
-touch "$RBAC_POLICY_PATH"
+POLICY_FILE="${POLICY_FILE:-/var/lib/everest/policy/policy.csv}"
+mkdir -p "$(dirname "$POLICY_FILE")"
+touch "$POLICY_FILE"
 
-# Initialize DB if needed (app also ensures schema)
-if [ -z "$DB_URL" ]; then
-python - <<'PY'
-import os, sqlite3
-db = os.environ.get("DB_PATH","/data/audit.db")
-conn = sqlite3.connect(db)
-conn.execute("CREATE TABLE IF NOT EXISTS audit_log(id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, actor TEXT NOT NULL, action TEXT NOT NULL, target TEXT NOT NULL, details TEXT NOT NULL);")
-conn.execute("CREATE TABLE IF NOT EXISTS counters(tenant TEXT PRIMARY KEY, clusters INTEGER NOT NULL DEFAULT 0);")
-conn.commit(); conn.close()
-PY
-else
-  echo "INFO: DB_URL set; skipping local SQLite init"
+SQLITE_DB="${SQLITE_DB:-/var/lib/everest/data/tenant_proxy.db}"
+mkdir -p "$(dirname "$SQLITE_DB")"
+
+# Ensure kubectl is present
+if ! command -v kubectl >/dev/null 2>&1; then
+  echo "kubectl binary not found in PATH" >&2
+  exit 1
 fi
 
-# Smoke check everestctl (best-effort)
-"$EVERESTCTL_PATH" version >/dev/null 2>&1 || true
+# Export kubeconfig (mounted read-only by docker-compose)
+export KUBECONFIG="${KUBECONFIG:-/data/kubeconfig}"
+if [ ! -f "$KUBECONFIG" ]; then
+  echo "Warning: KUBECONFIG file not found at $KUBECONFIG" >&2
+fi
 
 exec gunicorn -c gunicorn_conf.py app:app

@@ -1,20 +1,28 @@
+version: "3.9"
 services:
-  everestctl-api:
-    build:
-      context: .
-    env_file:
-      - .env
-    # No need to set KUBECONFIG explicitly; entrypoint auto-detects mounted kubeconfig
+  api:
+    image: ghcr.io/${GHCR_OWNER:-your-gh-username}/everestctl-api:latest
+    pull_policy: always
+    environment:
+      - ADMIN_API_KEY=${ADMIN_API_KEY}
+      - POLICY_FILE=/var/lib/everest/policy/policy.csv
+      - SQLITE_DB=/var/lib/everest/data/tenant_proxy.db
+      - LOG_LEVEL=INFO
+      - METRICS_ENABLED=false
+      - KUBECONFIG=/data/kubeconfig
     ports:
       - "8080:8080"
     volumes:
-      - ./data:/data
-      # Bind mount kubeconfig from host so everestctl can access the cluster
+      - ./var/policy:/var/lib/everest/policy
+      - ./var/data:/var/lib/everest/data
       - ${KUBECONFIG_HOST_PATH:-${HOME}/.kube/config}:/data/kubeconfig:ro
-    restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "python -c \"import urllib.request as u; print(u.urlopen('http://localhost:8080/healthz').read())\" >/dev/null 2>&1 || exit 1"]
+      test: ["CMD", "curl", "-f", "http://localhost:8080/healthz"]
       interval: 10s
-      timeout: 5s
+      timeout: 3s
       retries: 5
-      start_period: 10s
+    restart: unless-stopped
+
+volumes:
+  policy:
+  data:
