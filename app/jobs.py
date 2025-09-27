@@ -313,7 +313,36 @@ async def _preflight_debug(logger: logging.Logger) -> None:
     logger.info(
         f"preflight kubectl_version_exit={kv.exit_code} stderr_tail={_tail(kv.stderr)}"
     )
+    if kv.exit_code != 0:
+        kv2 = await execs.run_cmd_async(["kubectl", "version", "--client"], timeout=10)
+        logger.info(
+            f"preflight kubectl_version_fallback_exit={kv2.exit_code} stdout_tail={_tail(kv2.stdout)} stderr_tail={_tail(kv2.stderr)}"
+        )
     kc = await execs.run_cmd_async(["kubectl", "config", "current-context"], timeout=10)
     logger.info(
         f"preflight kubectl_context_exit={kc.exit_code} stdout_tail={_tail(kc.stdout)} stderr_tail={_tail(kc.stderr)}"
     )
+
+
+def _step_timeout(step: str) -> int:
+    """Resolve per-step timeouts from env with sensible defaults.
+
+    STEP envs:
+      - TIMEOUT_CREATE_ACCOUNT
+      - TIMEOUT_NAMESPACE_ADD
+      - TIMEOUT_APPLY_RESOURCES
+    Fallback to SUBPROCESS_TIMEOUT or 60 seconds.
+    """
+    mapping = {
+        "CREATE_ACCOUNT": "TIMEOUT_CREATE_ACCOUNT",
+        "NAMESPACE_ADD": "TIMEOUT_NAMESPACE_ADD",
+        "APPLY_RESOURCES": "TIMEOUT_APPLY_RESOURCES",
+    }
+    key = mapping.get(step.upper(), "")
+    default = int(os.environ.get("SUBPROCESS_TIMEOUT", "60"))
+    if key and os.environ.get(key):
+        try:
+            return int(os.environ[key])
+        except ValueError:
+            return default
+    return default
