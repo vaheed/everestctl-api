@@ -22,7 +22,7 @@ docker compose up --build
 ```
 
 The image already includes `kubectl` and `everestctl`.
-You only need to provide a kubeconfig via the compose mount.
+You must provide a kubeconfig via the compose mount; the service validates that a readable kubeconfig is present at startup.
 
 Kubeconfig: everestctl requires a kubeconfig. The compose files mount your host kubeconfig and set the appropriate environment so the CLI can use it. You can override the host path via `KUBECONFIG_HOST_PATH` in `.env`.
 

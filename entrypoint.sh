@@ -13,6 +13,13 @@ else
   if [ ! -x "$EVERESTCTL_PATH" ] && ! command -v "$EVERESTCTL_PATH" >/dev/null 2>&1; then
     echo "ERROR: everestctl not found at $EVERESTCTL_PATH"; exit 1
   fi
+  # Kubeconfig must be provided for CLI operations
+  if [ -z "${KUBECONFIG:-}" ]; then
+    echo "ERROR: KUBECONFIG is not set; mount your kubeconfig and set KUBECONFIG"; exit 1
+  fi
+  if [ ! -r "$KUBECONFIG" ]; then
+    echo "ERROR: kubeconfig not found or not readable at $KUBECONFIG"; exit 1
+  fi
 fi
 
 # Prepare data dir and files
