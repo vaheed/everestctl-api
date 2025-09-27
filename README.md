@@ -91,9 +91,8 @@ docker run --rm -p 8080:8080 -e ADMIN_API_KEY=changeme \
 
 - Header auth enforced for all mutating and protected routes.
 - Do not log secrets; logs contain minimal request metadata and a correlation id.
-- Container runs as non-root (UID 10001) but may require root if CLIs demand it; adjust Dockerfile accordingly.
+- Container runs as root by default to simplify access to mounted kubeconfig and CLIs. If you need to harden, switch to a non-root user and ensure kubeconfig permissions allow read access.
 
 ## References
 
 - Percona Everest docs: https://docs.percona.com/everest/
-

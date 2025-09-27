@@ -51,10 +51,6 @@ COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 COPY app ./app
 
-# Create non-root user; switch if CLIs work under non-root in your env
-RUN useradd -u 10001 -m appuser || true
-USER 10001
-
 EXPOSE 8080
 
 CMD ["uvicorn", "app.app:app", "--host", "0.0.0.0", "--port", "8080"]
