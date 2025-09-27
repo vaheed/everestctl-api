@@ -113,6 +113,53 @@ curl -X POST localhost:8080/tenants/rotate-password \
   -d '{"user":"alice","new_password":"NewS3cret!"}'
 ```
 
+### User management
+
+This API wraps common user operations from Everest. Refer to the official documentation for background and semantics: Manage Users (https://docs.percona.com/everest/administer/manage_users.html).
+
+- List users
+
+```bash
+curl -s -H "X-API-Key: $API_KEY" localhost:8080/users | jq
+```
+
+- Create user (optionally set password and initial enabled state)
+
+```bash
+curl -s -X POST localhost:8080/users/create \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: $API_KEY" \
+  -d '{"user":"bob","password":"S3cret123","enabled":true}' | jq
+```
+
+- Enable user / Disable user
+
+```bash
+curl -s -X POST localhost:8080/users/enable  \
+  -H "Content-Type: application/json" -H "X-API-Key: $API_KEY" \
+  -d '{"user":"bob"}' | jq
+
+curl -s -X POST localhost:8080/users/disable \
+  -H "Content-Type: application/json" -H "X-API-Key: $API_KEY" \
+  -d '{"user":"bob"}' | jq
+```
+
+- Set password
+
+```bash
+curl -s -X POST localhost:8080/users/set-password \
+  -H "Content-Type: application/json" -H "X-API-Key: $API_KEY" \
+  -d '{"user":"bob","new_password":"Stronger!Passw0rd"}' | jq
+```
+
+- Delete user
+
+```bash
+curl -s -X POST localhost:8080/users/delete \
+  -H "Content-Type: application/json" -H "X-API-Key: $API_KEY" \
+  -d '{"user":"bob"}' | jq
+```
+
 ### Quota info
 
 ```bash

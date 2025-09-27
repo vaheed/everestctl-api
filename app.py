@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from functools import lru_cache
 from typing import Optional, List, Dict, Any
 import contextlib
+import re
 
 from fastapi import FastAPI, Depends, HTTPException, Request, Response, status
 from fastapi.responses import JSONResponse, PlainTextResponse
@@ -288,6 +289,14 @@ class DeleteTenantRequest(BaseModel):
     user: str
     namespace: str
 
+class UserOnlyRequest(BaseModel):
+    user: str
+
+class CreateUserRequest(BaseModel):
+    user: str
+    password: Optional[str] = None
+    enabled: Optional[bool] = True
+
 # -------------------- RBAC Policy Helpers --------------------
 
 def read_policy(path: str) -> List[List[str]]:
@@ -397,6 +406,47 @@ async def run_cli(settings: Settings, args: List[str]) -> Dict[str, Any]:
             await asyncio.sleep(min(0.25 * (2**attempt), 2.0))
     raise HTTPException(502, f"CLI failed after retries: {last_exc}")
 
+def parse_accounts_table(text: str) -> List[Dict[str, Any]]:
+    """Parse `everestctl accounts list` tabular output into a list of dicts.
+    Expected header contains at least USER and ENABLED columns.
+    """
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        return []
+    # Split on 2+ spaces to accommodate column spacing
+    header_cols = re.split(r"\s{2,}", lines[0])
+    idx_user = header_cols.index("USER") if "USER" in header_cols else None
+    idx_caps = header_cols.index("CAPABILITIES") if "CAPABILITIES" in header_cols else None
+    idx_enabled = header_cols.index("ENABLED") if "ENABLED" in header_cols else None
+    results: List[Dict[str, Any]] = []
+    for line in lines[1:]:
+        parts = re.split(r"\s{2,}", line)
+        if idx_user is None or idx_enabled is None or len(parts) < 2:
+            # Fallback: try simple split
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+        item: Dict[str, Any] = {}
+        try:
+            if idx_user is not None and idx_user < len(parts):
+                item["user"] = parts[idx_user]
+            else:
+                item["user"] = parts[0]
+            if idx_caps is not None and idx_caps < len(parts):
+                caps = parts[idx_caps]
+                # Normalize [login,admin] -> ["login","admin"]
+                caps_inner = caps.strip().lstrip("[").rstrip("]").strip()
+                item["capabilities"] = [c.strip() for c in re.split(r"[,\s]+", caps_inner) if c.strip()] if caps_inner else []
+            if idx_enabled is not None and idx_enabled < len(parts):
+                item["enabled"] = parts[idx_enabled].lower() == "true"
+            elif len(parts) >= 2:
+                item["enabled"] = parts[-1].lower() == "true"
+        except Exception:
+            # Best-effort parsing; skip malformed lines
+            continue
+        results.append(item)
+    return results
+
 # -------------------- FastAPI App --------------------
 
 app = FastAPI(title="Everestctl API", version="1.0.0")
@@ -489,9 +539,10 @@ async def create_tenant(req: TenantRequest, _: None = Depends(api_key_auth), s: 
     ensure_engine_allowed(s, req.engine)
     ensure_cluster_quota(s, req.user)
     # Call CLI to create namespace/user with safe args (example commands)
-    # Note: Adjust args to your everestctl; here we use placeholders.
-    await run_cli(s, ["namespace", "create", f"name={req.namespace}"])
-    await run_cli(s, ["user", "create", f"user={req.user}", f"password={req.password}"])
+    # Note: Commands below follow Everest CLI conventions.
+    await run_cli(s, ["namespaces", "add", req.namespace])
+    await run_cli(s, ["accounts", "create", "-u", req.user])
+    await run_cli(s, ["accounts", "set-password", "-u", req.user, "-p", req.password])
     rbac_add(s.RBAC_POLICY_PATH, req.user, req.namespace)
     inc_counter(s.DB_PATH, req.user, +1)
     audit(
@@ -506,8 +557,8 @@ async def create_tenant(req: TenantRequest, _: None = Depends(api_key_auth), s: 
 
 @app.post("/tenants/delete")
 async def delete_tenant(req: DeleteTenantRequest, _: None = Depends(api_key_auth), s: Settings = Depends(get_settings)):
-    await run_cli(s, ["namespace", "delete", f"name={req.namespace}"])
-    await run_cli(s, ["user", "delete", f"user={req.user}"])
+    await run_cli(s, ["namespaces", "delete", req.namespace])
+    await run_cli(s, ["accounts", "delete", "-u", req.user])
     rbac_remove(s.RBAC_POLICY_PATH, req.user, req.namespace)
     inc_counter(s.DB_PATH, req.user, -1)
     audit(s.DB_PATH, actor="api", action="tenant_delete", target=req.user, details=req.dict())
@@ -516,7 +567,7 @@ async def delete_tenant(req: DeleteTenantRequest, _: None = Depends(api_key_auth
 
 @app.post("/tenants/rotate-password")
 async def rotate_password(req: RotatePasswordRequest, _: None = Depends(api_key_auth), s: Settings = Depends(get_settings)):
-    await run_cli(s, ["user", "update-password", f"user={req.user}", f"password={req.new_password}"])
+    await run_cli(s, ["accounts", "set-password", "-u", req.user, "-p", req.new_password])
     audit(s.DB_PATH, actor="api", action="password_rotate", target=req.user, details={"user": req.user})
     return {"status":"rotated", "user": req.user}
 
@@ -524,6 +575,53 @@ async def rotate_password(req: RotatePasswordRequest, _: None = Depends(api_key_
 async def get_quota(user: str, _: None = Depends(api_key_auth), s: Settings = Depends(get_settings)):
     used = get_counter(s.DB_PATH, user)
     return {"tenant": user, "used_clusters": used, "max": s.MAX_CLUSTERS_PER_TENANT}
+
+# --------------- Users APIs ---------------
+
+@app.get("/users")
+async def list_users(_: None = Depends(api_key_auth), s: Settings = Depends(get_settings)):
+    res = await run_cli(s, ["accounts", "list"])
+    raw = ""
+    if isinstance(res.get("stdout"), dict) and "raw" in res["stdout"]:
+        raw = res["stdout"]["raw"]
+    elif isinstance(res.get("stdout"), str):
+        raw = res["stdout"]
+    users = parse_accounts_table(raw)
+    return {"users": users}
+
+@app.post("/users/enable")
+async def enable_user(req: UserOnlyRequest, _: None = Depends(api_key_auth), s: Settings = Depends(get_settings)):
+    await run_cli(s, ["accounts", "enable", "-u", req.user])
+    audit(s.DB_PATH, actor="api", action="user_enable", target=req.user, details={"user": req.user})
+    return {"status": "enabled", "user": req.user}
+
+@app.post("/users/disable")
+async def disable_user(req: UserOnlyRequest, _: None = Depends(api_key_auth), s: Settings = Depends(get_settings)):
+    await run_cli(s, ["accounts", "disable", "-u", req.user])
+    audit(s.DB_PATH, actor="api", action="user_disable", target=req.user, details={"user": req.user})
+    return {"status": "disabled", "user": req.user}
+
+@app.post("/users/delete")
+async def delete_user(req: UserOnlyRequest, _: None = Depends(api_key_auth), s: Settings = Depends(get_settings)):
+    await run_cli(s, ["accounts", "delete", "-u", req.user])
+    audit(s.DB_PATH, actor="api", action="user_delete", target=req.user, details={"user": req.user})
+    return {"status": "deleted", "user": req.user}
+
+@app.post("/users/set-password")
+async def set_user_password(req: RotatePasswordRequest, _: None = Depends(api_key_auth), s: Settings = Depends(get_settings)):
+    await run_cli(s, ["accounts", "set-password", "-u", req.user, "-p", req.new_password])
+    audit(s.DB_PATH, actor="api", action="password_set", target=req.user, details={"user": req.user})
+    return {"status":"password_set", "user": req.user}
+
+@app.post("/users/create")
+async def create_user(req: CreateUserRequest, _: None = Depends(api_key_auth), s: Settings = Depends(get_settings)):
+    await run_cli(s, ["accounts", "create", "-u", req.user])
+    if req.password:
+        await run_cli(s, ["accounts", "set-password", "-u", req.user, "-p", req.password])
+    if req.enabled is False:
+        await run_cli(s, ["accounts", "disable", "-u", req.user])
+    audit(s.DB_PATH, actor="api", action="user_create", target=req.user, details={"user": req.user, "enabled": bool(req.enabled)})
+    return {"status": "created", "user": req.user, "enabled": bool(req.enabled)}
 
 # --------------- Error Handling ---------------
 
