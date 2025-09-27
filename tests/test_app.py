@@ -70,3 +70,36 @@ def test_create_tenant_cli_mock(client, monkeypatch):
     r = client.post("/tenants/create", headers=auth(), json=body)
     assert r.status_code==200
     assert r.json()["status"]=="created"
+    # Verify audit counter incremented
+    s = get_settings()
+    assert get_counter(s.DB_PATH, "alice") == 1
+
+def test_delete_tenant_cli_mock(client, monkeypatch):
+    # seed counter
+    s = get_settings()
+    init_db(s.DB_PATH)
+    inc_counter(s.DB_PATH, "alice", +1)
+    async def fake_run(settings, args):
+        return {"rc":0,"stdout":{"ok":True},"stderr":""}
+    monkeypatch.setattr("app.run_cli", fake_run)
+    body = {"user":"alice","namespace":"ns1"}
+    r = client.post("/tenants/delete", headers=auth(), json=body)
+    assert r.status_code==200
+    assert r.json()["status"]=="deleted"
+    assert get_counter(s.DB_PATH, "alice") == 0
+
+def test_rotate_password_cli_mock(client, monkeypatch):
+    async def fake_run(settings, args):
+        return {"rc":0,"stdout":{"ok":True},"stderr":""}
+    monkeypatch.setattr("app.run_cli", fake_run)
+    r = client.post("/tenants/rotate-password", headers=auth(), json={"user":"alice","new_password":"n"})
+    assert r.status_code==200
+    assert r.json()["status"]=="rotated"
+
+def test_engine_not_allowed(client, monkeypatch):
+    async def fake_run(settings, args):
+        return {"rc":0,"stdout":{"ok":True},"stderr":""}
+    monkeypatch.setattr("app.run_cli", fake_run)
+    body = {"user":"bob","namespace":"ns2","password":"p","engine":"oracle"}
+    r = client.post("/tenants/create", headers=auth(), json=body)
+    assert r.status_code==400
