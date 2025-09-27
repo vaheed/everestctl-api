@@ -1,327 +1,118 @@
-Everest Tenant Bootstrap Proxy
+# everestctl-api
 
-Production-grade FastAPI API that wraps everestctl for tenant lifecycle and per-namespace quotas with atomic RBAC policy management.
+Minimal FastAPI service exposing `everestctl account list` over HTTP with auth, containerization, tests, and CI.
 
-Quick start
-- Copy `.env.example` to `.env` and set `ADMIN_API_KEY`.
-- Set `GHCR_OWNER` in `.env` to your GitHub user/org.
-- Ensure your kubeconfig exists (default `${HOME}/.kube/config`).
-- Pull and run: `docker compose up` (compose pulls `ghcr.io/$GHCR_OWNER/everestctl-api:latest`).
-- Health: `curl -fsS localhost:8080/healthz`
-- Ready: `curl -fsS -H "X-Admin-Key: $ADMIN_API_KEY" localhost:8080/readyz`
+## Overview
 
-Endpoints
-- POST /bootstrap/tenant
-- CLI wrappers under /cli/*
-- RBAC: POST /rbac/append, POST /rbac/can
-- Limits: PUT /limits, GET /limits/{namespace}
-- Enforcement: POST /enforce/cluster-create
-- Usage: POST /usage/register-cluster, POST /usage/register-db-user
-- Day-2: DELETE /users, DELETE /namespaces, POST /users/rotate-password
-- Admin: GET /tenants, GET /audit, GET /users/raw, GET /namespaces/raw
+- Endpoint: `GET /accounts/list`
+- Auth: requires header `X-Admin-Key: <ADMIN_API_KEY>`
+- On success: runs `everestctl account list`, parses stdout (JSON pass-through or robust text-table parsing), and returns:
+  `{ "data": <parsed_result>, "source": "everestctl account list" }`
+- On auth failure: `401 {"error":"unauthorized"}`
+- On CLI failure: `502 {"error":"everestctl failed", "detail":"..."}`
+- On missing everestctl: `500 {"error":"everestctl not found", ...}`
 
-Notes
-- The service allow-lists everestctl argv and never uses a shell.
-- RBAC writes to `POLICY_FILE` atomically with timestamped backups and validates via everestctl.
-- Idempotency: POST honors Idempotency-Key and replays responses.
-- Metrics: enable with `METRICS_ENABLED=true` then GET /metrics.
-- The API manages per-tenant CRDs automatically during bootstrap and limit updates — no need to run kubectl manually.
+The service binds to `0.0.0.0` and uses `PORT` env var (default 8080).
 
-Testing
-- `pytest` (CLI calls are mocked by tests).
+## Quickstart
 
-CI/CD
-- GitHub Actions workflow `.github/workflows/ci.yml` runs tests on push/PR.
-- On pushes (non‑PR), builds and pushes Docker image to GHCR with tags:
-  - `sha-<shortsha>` for all branches
-  - `latest` for `main`
-  - `<git tag>` for tag refs
+Prerequisites:
 
-API Endpoints and Examples
-- All admin endpoints require `X-Admin-Key: $ADMIN_API_KEY`.
-- Replace values like ns-alice with your namespaces if needed.
+- Docker and docker-compose
+- A valid kubeconfig on the host at `~/.kube/config`
 
-Environment setup
-```bash
-export ADMIN_API_KEY=change-me
-# Base URL of the running service
-BASE_URL=http://localhost:8080
+Steps:
+
+1. Build and start
+
+   - `docker-compose up --build`
+
+2. Usage
+
+   - Export variables and call the API:
+
+     ```sh
+     export BASE_URL="http://localhost:8080"
+     export ADMIN_API_KEY="changeme"
+     curl -sS -X GET "$BASE_URL/accounts/list" -H "X-Admin-Key: $ADMIN_API_KEY"
+     ```
+
+## Configuration
+
+- `ADMIN_API_KEY` is required for authorization and is validated against the `X-Admin-Key` header.
+- `PORT` (default `8080`) controls the bind port.
+- `KUBECONFIG` is expected to be `/root/.kube/config` inside the container; compose mounts the host kubeconfig there.
+
+## Notes on everestctl
+
+- The Dockerfile installs `kubectl` and attempts to install `everestctl`.
+- Update the `EVERESTCTL_URL` in the Dockerfile to the correct Linux amd64 release URL if `everestctl` is a downloadable binary.
+- If `everestctl` is a Python package, the Dockerfile includes a fallback `pip install everestctl` step (commented behavior explained inline) — adjust as needed.
+- The container relies on a mounted kubeconfig at `/root/.kube/config` to operate with `kubectl`/`everestctl` using `KUBECONFIG` set.
+
+## Project Layout
+
+```
+.
+├── app/
+│   ├── app.py                 # FastAPI app + route
+│   ├── __init__.py
+│   ├── dependencies.py        # auth helpers, subprocess wrappers
+│   └── parsers.py             # parse everestctl output (JSON or text)
+├── tests/
+│   └── test_app.py            # pytest with subprocess mocking
+├── requirements.txt
+├── Dockerfile
+├── docker-compose.yml
+├── .dockerignore
+├── .gitignore
+├── .github/
+│   └── workflows/
+│       └── ci.yml             # test + deploy stages on push
+└── README.md
 ```
 
-Health and readiness
-```bash
-curl -fsS $BASE_URL/healthz
-curl -fsS -H "X-Admin-Key: $ADMIN_API_KEY" $BASE_URL/readyz
+## Development & Testing
+
+Local tests:
+
+```sh
+python -m venv .venv && . .venv/bin/activate
+pip install -r requirements.txt
+pytest -q
 ```
 
-Bootstrap tenants (Alice and Bob)
-```bash
-# Alice
-curl -sS -X POST $BASE_URL/bootstrap/tenant \
-  -H "X-Admin-Key: $ADMIN_API_KEY" \
-  -H "Idempotency-Key: 11111111-1111-1111-1111-111111111111" \
-  -H "Content-Type: application/json" \
-  -d '{
-        "username":"alice",
-        "password":"StrongP@ssw0rd",
-        "namespace":"ns-alice",
-        "operators":{"postgresql":true,"mongodb":false,"xtradb_cluster":true}
-      }'
+The tests mock `subprocess.run` to simulate `everestctl` output in JSON and tabular forms, and error scenarios.
 
-# Bob
-curl -sS -X POST $BASE_URL/bootstrap/tenant \
-  -H "X-Admin-Key: $ADMIN_API_KEY" \
-  -H "Idempotency-Key: 22222222-2222-2222-2222-222222222222" \
-  -H "Content-Type: application/json" \
-  -d '{
-        "username":"bob",
-        "password":"AnotherP@ss1",
-        "namespace":"ns-bob",
-        "operators":{"postgresql":true,"mongodb":true,"xtradb_cluster":false}
-      }'
+## CI/CD
 
-Bootstrap cheat sheet
-- Use Idempotency-Key header to safely retry.
-- Operators: set booleans for `postgresql`, `mongodb`, `xtradb_cluster`.
-- The bootstrap flow creates namespace, user, password, RBAC, CRD limits, and initializes counters.
+GitHub Actions workflow has two stages:
 
-Direct bootstrap (full example)
-```bash
-curl -sS -X POST $BASE_URL/bootstrap/tenant \
-  -H "X-Admin-Key: $ADMIN_API_KEY" \
-  -H "Idempotency-Key: 33333333-3333-3333-3333-333333333333" \
-  -H "Content-Type: application/json" \
-  -d '{
-        "username": "charlie",
-        "password": "S0meStr0ngP@ss",
-        "namespace": "ns-charlie",
-        "operators": {"postgresql": true, "mongodb": false, "xtradb_cluster": true}
-      }'
-# Example 200 OK response
-# {"status":"ok","namespace":"ns-charlie","username":"charlie"}
-```
+1. test
+   - Checks out code, sets up Python 3.11, caches pip, installs requirements, runs `pytest -q`.
+2. deploy (needs: test)
+   - Builds a Docker image tagged with `${{ github.sha }}`.
+   - Pushes the image to a registry if the following secrets are present: `REGISTRY`, `REGISTRY_USERNAME`, `REGISTRY_PASSWORD`, `IMAGE_NAME`.
+   - Includes a placeholder `kubectl apply` step that runs only if `KUBECONFIG_B64` and other registry secrets are present. Replace with your deployment commands.
 
-Template-based bootstrap
-1) Create a reusable template (includes defaults, operators, limits, extra RBAC)
-```bash
-curl -sS -X POST $BASE_URL/templates \
-  -H "X-Admin-Key: $ADMIN_API_KEY" -H "Content-Type: application/json" \
-  -d '{
-        "name": "standard-tenant",
-        "blueprint": {
-          "defaults": {"username": "tenantuser", "password": "ChangeMeP@ss1", "namespace": "ns-tenant"},
-          "operators": {"postgresql": true, "mongodb": false, "xtradb_cluster": false, "take_ownership": false},
-          "limits": {"namespace":"ns-tenant","max_clusters":3,"allowed_engines":["postgresql","mysql"],"cpu_limit_cores":4,"memory_limit_bytes":17179869184,"max_db_users":20},
-          "rbac_extra": [
-            "p, role:tenant-{namespace}, backup-storages, create, {namespace}/*",
-            "g, {username}, role:tenant-{namespace}"
-          ]
-        }
-      }'
-```
+Required secrets for deploy:
 
-2) Bootstrap a tenant from the template, overriding identity and limits
-```bash
-curl -sS -X POST $BASE_URL/bootstrap/from-template \
-  -H "X-Admin-Key: $ADMIN_API_KEY" \
-  -H "Idempotency-Key: 44444444-4444-4444-4444-444444444444" \
-  -H "Content-Type: application/json" \
-  -d '{
-        "template": "standard-tenant",
-        "username": "dana",
-        "password": "AnotherStrongP@ss",
-        "namespace": "ns-dana",
-        "operators": {"postgresql": true, "mongodb": true, "xtradb_cluster": false, "take_ownership": true},
-        "limits": {"namespace":"ns-dana","max_clusters":5,"allowed_engines":["postgresql","mongodb"],"cpu_limit_cores":8,"memory_limit_bytes":34359738368,"max_db_users":40}
-      }'
-# Example 200 OK response
-# {"status":"ok","namespace":"ns-dana","username":"dana","template":"standard-tenant"}
-```
-```
+- `REGISTRY` (e.g., `ghcr.io/owner/repo` or `registry.hub.docker.com`)
+- `REGISTRY_USERNAME`
+- `REGISTRY_PASSWORD`
+- `IMAGE_NAME` (e.g., `everestctl-api`)
 
-Accounts (API wrappers)
-```bash
-# Create user (Alice)
-curl -sS -X POST $BASE_URL/cli/accounts/create \
-  -H "X-Admin-Key: $ADMIN_API_KEY" -H "Content-Type: application/json" \
-  -d '{"username":"alice"}'
+Adjust registry/name as needed in `.github/workflows/ci.yml`.
 
-# Set password (Alice)
-curl -sS -X POST $BASE_URL/cli/accounts/set-password \
-  -H "X-Admin-Key: $ADMIN_API_KEY" -H "Content-Type: application/json" \
-  -d '{"username":"alice","new_password":"NewP@ss"}'
+## Troubleshooting
 
-# List users (raw output)
-curl -sS -X GET $BASE_URL/cli/accounts/list -H "X-Admin-Key: $ADMIN_API_KEY"
+- 401 unauthorized: Ensure you send `X-Admin-Key` and it matches `ADMIN_API_KEY`.
+- 500 everestctl not found: Validate that `everestctl` is installed in the container and on `PATH`. The Dockerfile includes installation steps — verify the URL or package installation.
+- 502 everestctl failed: Inspect the `detail` field for stderr from the command; ensure `KUBECONFIG` is valid and the process has necessary cluster access.
+- Missing kubeconfig: Ensure your host `~/.kube/config` exists; docker-compose mounts it read-only to `/root/.kube/config`.
 
-# Delete user (Alice)
-curl -sS -X DELETE $BASE_URL/cli/accounts \
-  -H "X-Admin-Key: $ADMIN_API_KEY" -H "Content-Type: application/json" \
-  -d '{"username":"alice"}'
-```
+## Security
 
-Namespaces (API wrappers)
-```bash
-# Add namespace for Alice (enable postgres operator only, do not take ownership)
-curl -sS -X POST $BASE_URL/cli/namespaces/add \
-  -H "X-Admin-Key: $ADMIN_API_KEY" -H "Content-Type: application/json" \
-  -d '{"namespace":"ns-alice","operators":{"postgresql":false},"take_ownership":false}'
+- The service never logs `ADMIN_API_KEY`.
+- Authorization enforced per request via `X-Admin-Key`.
 
-# Update namespace (enable mongodb for Alice)
-curl -sS -X POST $BASE_URL/cli/namespaces/update \
-  -H "X-Admin-Key: $ADMIN_API_KEY" -H "Content-Type: application/json" \
-  -d '{"namespace":"ns-alice","operators":{"mongodb":true}}'
-
-# Remove namespace (keep K8s namespace for Alice)
-curl -sS -X DELETE $BASE_URL/cli/namespaces/remove \
-  -H "X-Admin-Key: $ADMIN_API_KEY" -H "Content-Type: application/json" \
-  -d '{"namespace":"ns-alice","keep_namespace":true}'
-```
-
-RBAC administration (all via API)
-```bash
-# Append policy lines (atomic write + validate if APPLY_RBAC=true)
-cat > /tmp/policy_lines.txt <<'EOF'
-p, role:tenant-ns-alice, namespaces, read, ns-alice
-p, role:tenant-ns-alice, database-engines, read, ns-alice/*
-p, role:tenant-ns-alice, database-clusters, *, ns-alice/*
-p, role:tenant-ns-alice, database-cluster-backups, *, ns-alice/*
-p, role:tenant-ns-alice, database-cluster-restores, *, ns-alice/*
-p, role:tenant-ns-alice, database-cluster-credentials, read, ns-alice/*
-p, role:tenant-ns-alice, backup-storages, *, ns-alice/*
-p, role:tenant-ns-alice, monitoring-instances, *, ns-alice/*
-g, alice, role:tenant-ns-alice
-EOF
-
-curl -sS -X POST $BASE_URL/rbac/append \
-  -H "X-Admin-Key: $ADMIN_API_KEY" -H "Content-Type: application/json" \
-  -d "$(jq -Rn --slurpfile lines /tmp/policy_lines.txt '{lines:$lines|.[0]|split("\n")|map(select(length>0))}')"
-
-# Can check for Alice
-curl -sS -X POST $BASE_URL/rbac/can \
-  -H "X-Admin-Key: $ADMIN_API_KEY" -H "Content-Type: application/json" \
-  -d '{"user":"alice","resource":"database-clusters","verb":"create","object":"ns-alice/*"}'
-
-# Can check for Bob
-curl -sS -X POST $BASE_URL/rbac/can \
-  -H "X-Admin-Key: $ADMIN_API_KEY" -H "Content-Type: application/json" \
-  -d '{"user":"bob","resource":"database-clusters","verb":"create","object":"ns-bob/*"}'
-```
-
-Per‑namespace limits (Alice and Bob)
-```bash
-# Upsert limits for Alice
-curl -sS -X PUT $BASE_URL/limits \
-  -H "X-Admin-Key: $ADMIN_API_KEY" -H "Content-Type: application/json" \
-  -d '{
-        "namespace":"ns-alice",
-        "max_clusters":3,
-        "allowed_engines":["postgresql","mysql"],
-        "cpu_limit_cores":4,
-        "memory_limit_bytes":17179869184,
-        "max_db_users":20
-      }'
-
-# Read limits (Alice)
-curl -sS -X GET $BASE_URL/limits/ns-alice -H "X-Admin-Key: $ADMIN_API_KEY"
-
-# Upsert limits for Bob
-curl -sS -X PUT $BASE_URL/limits \
-  -H "X-Admin-Key: $ADMIN_API_KEY" -H "Content-Type: application/json" \
-  -d '{
-        "namespace":"ns-bob",
-        "max_clusters":5,
-        "allowed_engines":["postgresql","mongodb"],
-        "cpu_limit_cores":8,
-        "memory_limit_bytes":34359738368,
-        "max_db_users":40
-      }'
-
-# Read limits (Bob)
-curl -sS -X GET $BASE_URL/limits/ns-bob -H "X-Admin-Key: $ADMIN_API_KEY"
-```
-
-Enforcement checks
-```bash
-# Validate headroom for a new cluster (Alice)
-curl -sS -X POST $BASE_URL/enforce/cluster-create \
-  -H "X-Admin-Key: $ADMIN_API_KEY" -H "Content-Type: application/json" \
-  -d '{"namespace":"ns-alice","engine":"postgresql","cpu_request_cores":1,"memory_request_bytes":2147483648}'
-
-# Validate headroom for a new cluster (Bob)
-curl -sS -X POST $BASE_URL/enforce/cluster-create \
-  -H "X-Admin-Key: $ADMIN_API_KEY" -H "Content-Type: application/json" \
-  -d '{"namespace":"ns-bob","engine":"mongodb","cpu_request_cores":2,"memory_request_bytes":4294967296}'
-```
-
-Usage counters
-```bash
-# Register cluster create (increments usage for Alice)
-curl -sS -X POST $BASE_URL/usage/register-cluster \
-  -H "X-Admin-Key: $ADMIN_API_KEY" -H "Content-Type: application/json" \
-  -d '{"namespace":"ns-alice","op":"create","cpu_cores":1,"memory_bytes":2147483648}'
-
-# Register DB user create (Alice)
-curl -sS -X POST $BASE_URL/usage/register-db-user \
-  -H "X-Admin-Key: $ADMIN_API_KEY" -H "Content-Type: application/json" \
-  -d '{"namespace":"ns-alice","op":"create"}'
-
-# Register cluster delete (decrements usage for Alice)
-curl -sS -X POST $BASE_URL/usage/register-cluster \
-  -H "X-Admin-Key: $ADMIN_API_KEY" -H "Content-Type: application/json" \
-  -d '{"namespace":"ns-alice","op":"delete","cpu_cores":1,"memory_bytes":2147483648}'
-
-# Register cluster create (Bob)
-curl -sS -X POST $BASE_URL/usage/register-cluster \
-  -H "X-Admin-Key: $ADMIN_API_KEY" -H "Content-Type: application/json" \
-  -d '{"namespace":"ns-bob","op":"create","cpu_cores":2,"memory_bytes":4294967296}'
-
-# Register DB user create (Bob)
-curl -sS -X POST $BASE_URL/usage/register-db-user \
-  -H "X-Admin-Key: $ADMIN_API_KEY" -H "Content-Type: application/json" \
-  -d '{"namespace":"ns-bob","op":"create"}'
-```
-
-Day‑2 operations
-```bash
-# Remove user (Alice)
-curl -sS -X DELETE $BASE_URL/users \
-  -H "X-Admin-Key: $ADMIN_API_KEY" -H "Content-Type: application/json" \
-  -d '{"username":"bob"}'
-
-# Remove namespace entirely (Bob)
-curl -sS -X DELETE $BASE_URL/namespaces \
-  -H "X-Admin-Key: $ADMIN_API_KEY" -H "Content-Type: application/json" \
-  -d '{"namespace":"ns-bob","force":false,"keep_namespace":false}'
-
-# Rotate password (Alice)
-curl -sS -X POST $BASE_URL/users/rotate-password \
-  -H "X-Admin-Key: $ADMIN_API_KEY" -H "Content-Type: application/json" \
-  -d '{"username":"alice","new_password":"EvenStrongerP@ss2"}'
-
-# Rotate password (Bob)
-curl -sS -X POST $BASE_URL/users/rotate-password \
-  -H "X-Admin-Key: $ADMIN_API_KEY" -H "Content-Type: application/json" \
-  -d '{"username":"bob","new_password":"AnotherP@ss2"}'
-```
-
-Admin views
-```bash
-curl -sS -H "X-Admin-Key: $ADMIN_API_KEY" $BASE_URL/tenants | jq .
-curl -sS -H "X-Admin-Key: $ADMIN_API_KEY" $BASE_URL/audit | jq .
-curl -sS -H "X-Admin-Key: $ADMIN_API_KEY" $BASE_URL/users/raw
-curl -sS -H "X-Admin-Key: $ADMIN_API_KEY" $BASE_URL/namespaces/raw
-```
-
-Idempotency
-- For POST/PUT/DELETE, set an Idempotency-Key header (UUID recommended) to safely retry without duplicating operations.
-- Example header: `-H "Idempotency-Key: 33333333-3333-3333-3333-333333333333"`
-# Add namespace for Bob (enable postgres and mongodb, take ownership)
-curl -sS -X POST $BASE_URL/cli/namespaces/add \
-  -H "X-Admin-Key: $ADMIN_API_KEY" -H "Content-Type: application/json" \
-  -d '{"namespace":"ns-bob","operators":{"postgresql":true,"mongodb":true,"xtradb_cluster":false},"take_ownership":true}'
-
-# Remove namespace for Bob (delete K8s namespace)
-curl -sS -X DELETE $BASE_URL/cli/namespaces/remove \
-  -H "X-Admin-Key: $ADMIN_API_KEY" -H "Content-Type: application/json" \
-  -d '{"namespace":"ns-bob","keep_namespace":false}'

@@ -1,37 +1,49 @@
-FROM python:3.11-slim
+# syntax=docker/dockerfile:1
+FROM python:3.11-slim AS base
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-      tini ca-certificates curl && \
-    rm -rf /var/lib/apt/lists/*
-
-# Install kubectl
-ARG KUBECTL_VERSION=v1.29.6
-RUN curl -fsSLo /usr/local/bin/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl" \
-    && chmod +x /usr/local/bin/kubectl \
-    && /usr/local/bin/kubectl version --client --output=yaml || true
-
-# Install everestctl (override EVERESTCTL_URI at build time if needed)
-ARG EVERESTCTL_URI=https://github.com/percona/everest/releases/latest/download/everestctl-linux-amd64
-RUN curl -fsSLo /usr/local/bin/everestctl "$EVERESTCTL_URI" \
-    && chmod +x /usr/local/bin/everestctl \
-    && /usr/local/bin/everestctl help || true
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
+    KUBECONFIG=/root/.kube/config
 
 WORKDIR /app
-COPY requirements.txt .
+
+# System deps
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates curl bash gnupg \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install kubectl (stable Linux amd64)
+# Reference: https://kubernetes.io/docs/tasks/tools/install-kubectl-linux/
+RUN set -eux; \
+    KVER=$(curl -L -s https://dl.k8s.io/release/stable.txt); \
+    curl -fsSLo /usr/local/bin/kubectl "https://dl.k8s.io/release/${KVER}/bin/linux/amd64/kubectl"; \
+    chmod +x /usr/local/bin/kubectl; \
+    kubectl version --client --output=yaml || true
+
+# Install everestctl
+# Note: Update the URL below to the correct everestctl binary release for Linux amd64.
+# If everestctl is a Python package, uncomment the pip install fallback.
+ENV EVERESTCTL_URL="https://example.com/everestctl/releases/latest/linux-amd64/everestctl"
+RUN set -eux; \
+    if curl -fsSLo /usr/local/bin/everestctl "$EVERESTCTL_URL"; then \
+      chmod +x /usr/local/bin/everestctl; \
+      /usr/local/bin/everestctl --help || true; \
+    else \
+      echo "Warning: direct download failed; trying pip install everestctl"; \
+      pip install --no-cache-dir everestctl || true; \
+    fi
+
+# Python deps
+COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY . .
+# App code
+COPY app ./app
 
-RUN adduser --disabled-password --gecos '' appuser && \
-    mkdir -p /var/lib/everest/policy /var/lib/everest/data && \
-    chown -R appuser:appuser /var/lib/everest /app
+EXPOSE 8080
 
-USER appuser
+# Start the server; PORT is read at runtime
+CMD ["sh", "-c", "uvicorn app.app:app --host 0.0.0.0 --port ${PORT:-8080}"]
 
-ENV KUBECONFIG=/data/kubeconfig
-
-ENTRYPOINT ["/usr/bin/tini", "--"]
-CMD ["sh", "entrypoint.sh"]
