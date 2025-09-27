@@ -113,7 +113,11 @@ async def get_job_result(job_id: str):
 @app.get("/accounts/list", dependencies=[Depends(require_admin_key)])
 async def accounts_list():
     # Intentionally using singular per instruction: `everestctl account list`
-    res = execs.run_cmd(["everestctl", "account", "list"])  # type: ignore[arg-type]
+    cmd = ["everestctl", "account", "list"]
+    res = execs.run_cmd(cmd)  # type: ignore[arg-type]
+    logger.info(
+        f"request accounts_list exit={res.exit_code} stderr_tail={(res.stderr or '').strip()[-200:]}"
+    )
     if res.exit_code != 0:
         # Provide stderr tail
         detail = res.stderr[-500:] if res.stderr else ""

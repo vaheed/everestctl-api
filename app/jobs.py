@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
+import shutil
+import time
 import uuid
 from dataclasses import dataclass, field, asdict
 from typing import Any, Dict, List, Optional
@@ -83,7 +86,9 @@ job_store = JobStore()
 
 async def run_bootstrap_job(job: Job) -> None:
     try:
+        logger = logging.getLogger("everestctl_api")
         job.status = "running"
+        job.started_at = time.time()
         await job_store.set(job)
 
         username = str(job.inputs["username"]).strip()
@@ -100,6 +105,23 @@ async def run_bootstrap_job(job: Job) -> None:
         ram_mb = int(resources.get("ram_mb", 2048))
         disk_gb = int(resources.get("disk_gb", 20))
 
+        # Preflight
+        if not shutil.which("everestctl"):
+            job.status = "failed"
+            job.summary = "everestctl not found on PATH"
+            job.finished_at = time.time()
+            await job_store.set(job)
+            logger.error(f"job_id={job.job_id} preflight failed: everestctl not found")
+            return
+
+        ver = execs.run_cmd(["everestctl", "--version"])  # may be non-zero
+        logger.info(
+            f"job_id={job.job_id} start username={username} namespace={namespace} "
+            f"operators={{mongodb:{mongodb},postgresql:{postgresql},xtradb_cluster:{xtradb}}} "
+            f"take_ownership={take_ownership} resources={{cpu:{cpu_cores},ram:{ram_mb}Mi,disk:{disk_gb}Gi}} "
+            f"everestctl_version_exit={ver.exit_code}"
+        )
+
         # Step 1: create account
         cmd1 = ["everestctl", "accounts", "create", "-u", username]
         res1 = execs.run_cmd(cmd1)
@@ -113,11 +135,18 @@ async def run_bootstrap_job(job: Job) -> None:
             finished_at=res1.finished_at,
         )
         job.steps.append(step1)
+        logger.info(
+            f"job_id={job.job_id} step=create_account exit={res1.exit_code} stderr_tail={_tail(res1.stderr)}"
+        )
         if res1.exit_code != 0:
             job.status = "failed"
             job.summary = f"Failed to create account for {username}"
             job.finished_at = res1.finished_at
             await job_store.set(job)
+            logger.error(
+                f"job_id={job.job_id} failed create_account command='{step1.command}' exit={res1.exit_code} "
+                f"stderr_tail={_tail(res1.stderr)}"
+            )
             return
 
         # Step 2: namespace add
@@ -143,11 +172,18 @@ async def run_bootstrap_job(job: Job) -> None:
             finished_at=res2.finished_at,
         )
         job.steps.append(step2)
+        logger.info(
+            f"job_id={job.job_id} step=add_namespace exit={res2.exit_code} stderr_tail={_tail(res2.stderr)}"
+        )
         if res2.exit_code != 0:
             job.status = "failed"
             job.summary = f"Failed to add namespace {namespace}"
             job.finished_at = res2.finished_at
             await job_store.set(job)
+            logger.error(
+                f"job_id={job.job_id} failed add_namespace command='{step2.command}' exit={res2.exit_code} "
+                f"stderr_tail={_tail(res2.stderr)}"
+            )
             return
 
         # Step 3: apply resource quota & limit range
@@ -165,11 +201,18 @@ async def run_bootstrap_job(job: Job) -> None:
             manifest_preview=manifest,
         )
         job.steps.append(step3)
+        logger.info(
+            f"job_id={job.job_id} step=apply_resource_quota exit={res3.exit_code} stderr_tail={_tail(res3.stderr)}"
+        )
         if res3.exit_code != 0:
             job.status = "failed"
             job.summary = f"Failed to apply quota/limits to {namespace}"
             job.finished_at = res3.finished_at
             await job_store.set(job)
+            logger.error(
+                f"job_id={job.job_id} failed apply_resource_quota command='{step3.command}' exit={res3.exit_code} "
+                f"stderr_tail={_tail(res3.stderr)}"
+            )
             return
 
         # Step 4: RBAC policy
@@ -186,11 +229,19 @@ async def run_bootstrap_job(job: Job) -> None:
             rbac_applied=r.get("rbac_applied"),
         )
         job.steps.append(step4)
+        logger.info(
+            f"job_id={job.job_id} step=apply_rbac_policy exit={step4.exit_code} "
+            f"rbac_applied={step4.rbac_applied} stderr_tail={_tail(step4.stderr or '')}"
+        )
         if step4.rbac_applied is False and os.environ.get("EVEREST_RBAC_APPLY_CMD"):
             job.status = "failed"
             job.summary = f"RBAC apply failed for {namespace}"
             job.finished_at = step4.finished_at
             await job_store.set(job)
+            logger.error(
+                f"job_id={job.job_id} failed apply_rbac_policy command='{step4.command}' exit={step4.exit_code} "
+                f"stderr_tail={_tail(step4.stderr or '')}"
+            )
             return
 
         job.status = "succeeded"
@@ -200,8 +251,21 @@ async def run_bootstrap_job(job: Job) -> None:
         )
         job.finished_at = step4.finished_at
         await job_store.set(job)
+        logger.info(f"job_id={job.job_id} completed status={job.status}")
 
     except Exception as e:  # noqa: BLE001
         job.status = "failed"
         job.summary = f"Unexpected error: {e}"
         await job_store.set(job)
+        logging.getLogger("everestctl_api").exception(
+            f"job_id={job.job_id} unexpected_error"
+        )
+
+
+def _tail(s: Optional[str], max_chars: int = 400) -> str:
+    if not s:
+        return ""
+    s = s.strip()
+    if len(s) <= max_chars:
+        return s
+    return "…" + s[-max_chars:]
