@@ -4,6 +4,7 @@ import asyncio
 import logging
 import os
 import shutil
+import stat
 import time
 import uuid
 from dataclasses import dataclass, field, asdict
@@ -114,6 +115,9 @@ async def run_bootstrap_job(job: Job) -> None:
             logger.error(f"job_id={job.job_id} preflight failed: everestctl not found")
             return
 
+        # Preflight diagnostics
+        await _preflight_debug(logger)
+
         ver = await execs.run_cmd_async(["everestctl", "version"])  # prints components version
         logger.info(
             f"job_id={job.job_id} start username={username} namespace={namespace} "
@@ -123,8 +127,8 @@ async def run_bootstrap_job(job: Job) -> None:
         )
 
         # Step 1: create account
-        cmd1 = ["everestctl", "--json", "accounts", "create", "-u", username]
-        res1 = await execs.run_cmd_tty_async(cmd1)
+        cmd1 = _everest_cmd(["accounts", "create", "-u", username])
+        res1 = await execs.run_cmd_tty_async(cmd1, timeout=_step_timeout("CREATE_ACCOUNT"))
         step1 = JobStep(
             name="create_account",
             command=execs.format_command(cmd1),
@@ -140,7 +144,12 @@ async def run_bootstrap_job(job: Job) -> None:
         )
         if res1.exit_code != 0:
             job.status = "failed"
-            job.summary = f"Failed to create account for {username}"
+            if res1.exit_code == 124:
+                job.summary = (
+                    f"Timeout creating account for {username}. Increase TIMEOUT_CREATE_ACCOUNT or check Everest connectivity."
+                )
+            else:
+                job.summary = f"Failed to create account for {username}"
             job.finished_at = res1.finished_at
             await job_store.set(job)
             logger.error(
@@ -150,19 +159,17 @@ async def run_bootstrap_job(job: Job) -> None:
             return
 
         # Step 2: namespace add
-        cmd2 = [
-            "everestctl",
-            "--json",
+        cmd2 = _everest_cmd([
             "namespaces",
             "add",
             namespace,
             f"--operator.mongodb={'true' if mongodb else 'false'}",
             f"--operator.postgresql={'true' if postgresql else 'false'}",
             f"--operator.xtradb-cluster={'true' if xtradb else 'false'}",
-        ]
+        ])
         if take_ownership:
             cmd2.append("--take-ownership")
-        res2 = await execs.run_cmd_tty_async(cmd2)
+        res2 = await execs.run_cmd_tty_async(cmd2, timeout=_step_timeout("NAMESPACE_ADD"))
         step2 = JobStep(
             name="add_namespace",
             command=execs.format_command(cmd2),
@@ -190,7 +197,7 @@ async def run_bootstrap_job(job: Job) -> None:
         # Step 3: apply resource quota & limit range
         manifest = build_quota_and_limits_yaml(namespace, cpu_cores, ram_mb, disk_gb)
         cmd3 = ["kubectl", "apply", "-n", namespace, "-f", "-"]
-        res3 = await execs.run_cmd_async(cmd3, input_text=manifest)
+        res3 = await execs.run_cmd_async(cmd3, input_text=manifest, timeout=_step_timeout("APPLY_RESOURCES"))
         step3 = JobStep(
             name="apply_resource_quota",
             command=execs.format_command(cmd3),
@@ -270,3 +277,43 @@ def _tail(s: Optional[str], max_chars: int = 400) -> str:
     if len(s) <= max_chars:
         return s
     return "…" + s[-max_chars:]
+
+
+def _everest_cmd(parts: List[str]) -> List[str]:
+    base: List[str] = ["everestctl"]
+    if os.environ.get("EVERESTCTL_VERBOSE") == "1":
+        base.append("-v")
+    base.append("--json")
+    kube = os.environ.get("KUBECONFIG")
+    if kube:
+        base += ["-k", kube]
+    extra = os.environ.get("EVERESTCTL_EXTRA_ARGS")
+    if extra:
+        base += extra.split()
+    return base + parts
+
+
+async def _preflight_debug(logger: logging.Logger) -> None:
+    kube = os.environ.get("KUBECONFIG", "")
+    exists = os.path.exists(kube)
+    mode = owner = group = ""
+    if exists:
+        st = os.stat(kube)
+        mode = oct(stat.S_IMODE(st.st_mode))
+        owner = str(st.st_uid)
+        group = str(st.st_gid)
+    logger.info(
+        f"preflight kubeconfig path={kube or 'unset'} exists={exists} mode={mode} owner={owner} group={group}"
+    )
+    which_kubectl = await execs.run_cmd_async(["which", "kubectl"], timeout=5)
+    logger.info(
+        f"preflight kubectl_path_exit={which_kubectl.exit_code} path={which_kubectl.stdout.strip()}"
+    )
+    kv = await execs.run_cmd_async(["kubectl", "version", "--client", "--short"], timeout=10)
+    logger.info(
+        f"preflight kubectl_version_exit={kv.exit_code} stderr_tail={_tail(kv.stderr)}"
+    )
+    kc = await execs.run_cmd_async(["kubectl", "config", "current-context"], timeout=10)
+    logger.info(
+        f"preflight kubectl_context_exit={kc.exit_code} stdout_tail={_tail(kc.stdout)} stderr_tail={_tail(kc.stderr)}"
+    )
