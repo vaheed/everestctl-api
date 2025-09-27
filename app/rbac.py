@@ -5,7 +5,7 @@ import shlex
 import tempfile
 from typing import Optional, Dict, Any, List
 
-from .execs import run_cmd, format_command
+from . import execs
 
 
 def build_policy_csv(username: str, namespace: str) -> str:
@@ -52,14 +52,17 @@ def apply_rbac_policy(policy_csv: str) -> Dict[str, Any]:
     else:
         parts = parts + ["--file", policy_path]
 
-    res = run_cmd(parts)
+    # Use TTY if everestctl, some subcommands may expect it
+    if parts and parts[0] == "everestctl":
+        res = execs.run_cmd_tty(parts)
+    else:
+        res = execs.run_cmd(parts)
     return {
         "rbac_applied": res.exit_code == 0,
-        "command": format_command(parts),
+        "command": execs.format_command(parts),
         "exit_code": res.exit_code,
         "stdout": res.stdout,
         "stderr": res.stderr,
         "started_at": res.started_at,
         "finished_at": res.finished_at,
     }
-

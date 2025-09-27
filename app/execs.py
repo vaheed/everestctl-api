@@ -1,4 +1,5 @@
 import os
+import shutil
 import shlex
 import subprocess
 import sys
@@ -82,6 +83,31 @@ def run_cmd(
     )
 
 
+def run_cmd_tty(
+    cmd: List[str],
+    input_text: Optional[str] = None,
+    timeout: int = DEFAULT_TIMEOUT,
+    env: Optional[Dict[str, str]] = None,
+) -> CmdResult:
+    """
+    Attempt to run a command with a pseudo-TTY using `script` if available.
+    Falls back to run_cmd if `script` is missing.
+    """
+    if shutil.which("script") is None:
+        return run_cmd(cmd, input_text=input_text, timeout=timeout, env=env)
+
+    # Use script -qfc "<cmd>" /dev/null
+    # We avoid shell injection by joining with shlex.quote
+    quoted = format_command(cmd)
+    wrapper = [
+        "script",
+        "-qfc",
+        quoted,
+        "/dev/null",
+    ]
+    return run_cmd(wrapper, input_text=input_text, timeout=timeout, env=env)
+
+
 def _strip_and_truncate(s: str) -> str:
     s = _strip_ansi(s or "")
     if len(s) > MAX_OUTPUT_CHARS:
@@ -91,4 +117,3 @@ def _strip_and_truncate(s: str) -> str:
 
 def format_command(cmd: List[str]) -> str:
     return " ".join(shlex.quote(c) for c in cmd)
-

@@ -7,7 +7,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     KUBECONFIG=/root/.kube/config
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends curl ca-certificates bash git \
+    && apt-get install -y --no-install-recommends curl ca-certificates bash git util-linux \
     && rm -rf /var/lib/apt/lists/*
 
 # Install kubectl (linux/amd64)

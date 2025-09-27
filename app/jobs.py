@@ -114,7 +114,7 @@ async def run_bootstrap_job(job: Job) -> None:
             logger.error(f"job_id={job.job_id} preflight failed: everestctl not found")
             return
 
-        ver = execs.run_cmd(["everestctl", "--version"])  # may be non-zero
+        ver = execs.run_cmd(["everestctl", "version"])  # prints components version
         logger.info(
             f"job_id={job.job_id} start username={username} namespace={namespace} "
             f"operators={{mongodb:{mongodb},postgresql:{postgresql},xtradb_cluster:{xtradb}}} "
@@ -123,8 +123,8 @@ async def run_bootstrap_job(job: Job) -> None:
         )
 
         # Step 1: create account
-        cmd1 = ["everestctl", "accounts", "create", "-u", username]
-        res1 = execs.run_cmd(cmd1)
+        cmd1 = ["everestctl", "--json", "accounts", "create", "-u", username]
+        res1 = execs.run_cmd_tty(cmd1)
         step1 = JobStep(
             name="create_account",
             command=execs.format_command(cmd1),
@@ -152,6 +152,7 @@ async def run_bootstrap_job(job: Job) -> None:
         # Step 2: namespace add
         cmd2 = [
             "everestctl",
+            "--json",
             "namespaces",
             "add",
             namespace,
@@ -161,7 +162,7 @@ async def run_bootstrap_job(job: Job) -> None:
         ]
         if take_ownership:
             cmd2.append("--take-ownership")
-        res2 = execs.run_cmd(cmd2)
+        res2 = execs.run_cmd_tty(cmd2)
         step2 = JobStep(
             name="add_namespace",
             command=execs.format_command(cmd2),
