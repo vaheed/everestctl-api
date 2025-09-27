@@ -1,6 +1,7 @@
 import os
 import time
 from fastapi.testclient import TestClient
+import asyncio
 
 from app.app import app
 from app import execs
@@ -15,6 +16,19 @@ def test_bootstrap_job_flow(monkeypatch):
         return execs.CmdResult(0, "ok", "", 0.0, 0.0)
 
     monkeypatch.setattr(execs, "run_cmd", fake_run_cmd)
+
+    async def fake_run_cmd_async(cmd, input_text=None, timeout=60, env=None):
+        return fake_run_cmd(cmd, input_text, timeout, env)
+
+    def fake_run_cmd_tty(cmd, input_text=None, timeout=60, env=None):
+        return fake_run_cmd(cmd, input_text, timeout, env)
+
+    async def fake_run_cmd_tty_async(cmd, input_text=None, timeout=60, env=None):
+        return fake_run_cmd(cmd, input_text, timeout, env)
+
+    monkeypatch.setattr(execs, "run_cmd_async", fake_run_cmd_async)
+    monkeypatch.setattr(execs, "run_cmd_tty", fake_run_cmd_tty)
+    monkeypatch.setattr(execs, "run_cmd_tty_async", fake_run_cmd_tty_async)
 
     r = client.post(
         "/bootstrap/users",

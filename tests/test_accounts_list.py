@@ -25,6 +25,9 @@ def test_accounts_list_json(monkeypatch):
         return execs.CmdResult(0, json.dumps({"ok": True}), "", 0.0, 0.0)
 
     monkeypatch.setattr(execs, "run_cmd", fake_run_cmd)
+    async def fake_run_cmd_async(cmd, input_text=None, timeout=60, env=None):
+        return fake_run_cmd(cmd, input_text, timeout, env)
+    monkeypatch.setattr(execs, "run_cmd_async", fake_run_cmd_async)
     r = client.get("/accounts/list", headers=auth_headers())
     assert r.status_code == 200
     assert r.json() == {"data": {"ok": True}}
@@ -38,6 +41,9 @@ def test_accounts_list_table(monkeypatch):
         return execs.CmdResult(0, table, "", 0.0, 0.0)
 
     monkeypatch.setattr(execs, "run_cmd", fake_run_cmd)
+    async def fake_run_cmd_async2(cmd, input_text=None, timeout=60, env=None):
+        return fake_run_cmd(cmd, input_text, timeout, env)
+    monkeypatch.setattr(execs, "run_cmd_async", fake_run_cmd_async2)
     r = client.get("/accounts/list", headers=auth_headers())
     assert r.status_code == 200
     assert r.json() == {"data": [{"NAME": "alice", "ID": "1"}]}
@@ -50,6 +56,9 @@ def test_accounts_list_error(monkeypatch):
         return execs.CmdResult(1, "", "boom", 0.0, 0.0)
 
     monkeypatch.setattr(execs, "run_cmd", fake_run_cmd)
+    async def fake_run_cmd_async3(cmd, input_text=None, timeout=60, env=None):
+        return fake_run_cmd(cmd, input_text, timeout, env)
+    monkeypatch.setattr(execs, "run_cmd_async", fake_run_cmd_async3)
     r = client.get("/accounts/list", headers=auth_headers())
     assert r.status_code == 502
     body = r.json()

@@ -114,7 +114,7 @@ async def run_bootstrap_job(job: Job) -> None:
             logger.error(f"job_id={job.job_id} preflight failed: everestctl not found")
             return
 
-        ver = execs.run_cmd(["everestctl", "version"])  # prints components version
+        ver = await execs.run_cmd_async(["everestctl", "version"])  # prints components version
         logger.info(
             f"job_id={job.job_id} start username={username} namespace={namespace} "
             f"operators={{mongodb:{mongodb},postgresql:{postgresql},xtradb_cluster:{xtradb}}} "
@@ -124,7 +124,7 @@ async def run_bootstrap_job(job: Job) -> None:
 
         # Step 1: create account
         cmd1 = ["everestctl", "--json", "accounts", "create", "-u", username]
-        res1 = execs.run_cmd_tty(cmd1)
+        res1 = await execs.run_cmd_tty_async(cmd1)
         step1 = JobStep(
             name="create_account",
             command=execs.format_command(cmd1),
@@ -162,7 +162,7 @@ async def run_bootstrap_job(job: Job) -> None:
         ]
         if take_ownership:
             cmd2.append("--take-ownership")
-        res2 = execs.run_cmd_tty(cmd2)
+        res2 = await execs.run_cmd_tty_async(cmd2)
         step2 = JobStep(
             name="add_namespace",
             command=execs.format_command(cmd2),
@@ -190,7 +190,7 @@ async def run_bootstrap_job(job: Job) -> None:
         # Step 3: apply resource quota & limit range
         manifest = build_quota_and_limits_yaml(namespace, cpu_cores, ram_mb, disk_gb)
         cmd3 = ["kubectl", "apply", "-n", namespace, "-f", "-"]
-        res3 = execs.run_cmd(cmd3, input_text=manifest)
+        res3 = await execs.run_cmd_async(cmd3, input_text=manifest)
         step3 = JobStep(
             name="apply_resource_quota",
             command=execs.format_command(cmd3),

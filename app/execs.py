@@ -1,5 +1,6 @@
 import os
 import shutil
+import asyncio
 import shlex
 import subprocess
 import sys
@@ -117,3 +118,21 @@ def _strip_and_truncate(s: str) -> str:
 
 def format_command(cmd: List[str]) -> str:
     return " ".join(shlex.quote(c) for c in cmd)
+
+
+async def run_cmd_async(
+    cmd: List[str],
+    input_text: Optional[str] = None,
+    timeout: int = DEFAULT_TIMEOUT,
+    env: Optional[Dict[str, str]] = None,
+) -> CmdResult:
+    return await asyncio.to_thread(run_cmd, cmd, input_text, timeout, env)
+
+
+async def run_cmd_tty_async(
+    cmd: List[str],
+    input_text: Optional[str] = None,
+    timeout: int = DEFAULT_TIMEOUT,
+    env: Optional[Dict[str, str]] = None,
+) -> CmdResult:
+    return await asyncio.to_thread(run_cmd_tty, cmd, input_text, timeout, env)

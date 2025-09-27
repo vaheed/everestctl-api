@@ -114,7 +114,7 @@ async def get_job_result(job_id: str):
 async def accounts_list():
     # Intentionally using singular per instruction: `everestctl account list`
     cmd = ["everestctl", "--json", "account", "list"]
-    res = execs.run_cmd(cmd)  # type: ignore[arg-type]
+    res = await execs.run_cmd_async(cmd)  # type: ignore[arg-type]
     logger.info(
         f"request accounts_list exit={res.exit_code} stderr_tail={(res.stderr or '').strip()[-200:]}"
     )
