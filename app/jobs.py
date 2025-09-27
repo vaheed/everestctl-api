@@ -97,6 +97,7 @@ async def run_bootstrap_job(job: Job) -> None:
         operators = job.inputs.get("operators", {}) or {}
         take_ownership = bool(job.inputs.get("take_ownership", False))
         resources = job.inputs.get("resources", {}) or {}
+        password = job.inputs.get("password") or os.environ.get("EVEREST_ACCOUNT_PASSWORD") or os.environ.get("DEFAULT_ACCOUNT_PASSWORD")
 
         mongodb = bool(operators.get("mongodb", False))
         postgresql = bool(operators.get("postgresql", False))
@@ -126,12 +127,26 @@ async def run_bootstrap_job(job: Job) -> None:
             f"everestctl_version_exit={ver.exit_code}"
         )
 
-        # Step 1: create account
-        cmd1 = _everest_cmd(["accounts", "create", "-u", username])
-        res1 = await execs.run_cmd_tty_async(cmd1, timeout=_step_timeout("CREATE_ACCOUNT"))
+        # Step 1: create account (long flags per CLI docs; fallback to short flags)
+        if not password:
+            job.status = "failed"
+            job.summary = (
+                "Password required for account creation. Provide 'password' in payload or set EVEREST_ACCOUNT_PASSWORD."
+            )
+            job.finished_at = time.time()
+            await job_store.set(job)
+            logger.error(f"job_id={job.job_id} missing password for account create")
+            return
+
+        create_variants = [
+            _everest_cmd(["accounts", "create", "--username", username, "--password", str(password)]),
+            _everest_cmd(["accounts", "create", "-u", username, "-p", str(password)]),
+            _everest_cmd(["account", "create", "--username", username, "--password", str(password)]),
+        ]
+        res1, used_cmd1 = await _try_cmd_variants(create_variants, tty=True, timeout=_step_timeout("CREATE_ACCOUNT"))
         step1 = JobStep(
             name="create_account",
-            command=execs.format_command(cmd1),
+            command=_safe_command(used_cmd1),
             exit_code=res1.exit_code,
             stdout=res1.stdout,
             stderr=res1.stderr,
@@ -159,20 +174,34 @@ async def run_bootstrap_job(job: Job) -> None:
             return
 
         # Step 2: namespace add
-        cmd2 = _everest_cmd([
-            "namespaces",
-            "add",
-            namespace,
+        op_flags_dash = [
             f"--operator.mongodb={'true' if mongodb else 'false'}",
             f"--operator.postgresql={'true' if postgresql else 'false'}",
             f"--operator.xtradb-cluster={'true' if xtradb else 'false'}",
-        ])
+        ]
+        op_flags_underscore = [
+            f"--operator.mongodb={'true' if mongodb else 'false'}",
+            f"--operator.postgresql={'true' if postgresql else 'false'}",
+            f"--operator.xtradb_cluster={'true' if xtradb else 'false'}",
+        ]
+        ownership_variants: list[list[str]] = [[]]
         if take_ownership:
-            cmd2.append("--take-ownership")
-        res2 = await execs.run_cmd_tty_async(cmd2, timeout=_step_timeout("NAMESPACE_ADD"))
+            ownership_variants = [
+                ["--take-ownership"],
+                ["--owner", username],
+                ["--assign-owner", username],
+            ]
+
+        ns_variants: list[list[str]] = []
+        for subcmd in (["namespaces", "add"], ["namespaces", "create"], ["namespace", "add"]):
+            for ops in (op_flags_dash, op_flags_underscore):
+                for own in ownership_variants:
+                    ns_variants.append(_everest_cmd(list(subcmd) + [namespace] + ops + own))
+
+        res2, used_cmd2 = await _try_cmd_variants(ns_variants, tty=True, timeout=_step_timeout("NAMESPACE_ADD"))
         step2 = JobStep(
             name="add_namespace",
-            command=execs.format_command(cmd2),
+            command=execs.format_command(used_cmd2),
             exit_code=res2.exit_code,
             stdout=res2.stdout,
             stderr=res2.stderr,
@@ -322,6 +351,53 @@ async def _preflight_debug(logger: logging.Logger) -> None:
     logger.info(
         f"preflight kubectl_context_exit={kc.exit_code} stdout_tail={_tail(kc.stdout)} stderr_tail={_tail(kc.stderr)}"
     )
+
+
+def _safe_command(cmd: List[str]) -> str:
+    """Return a redacted, shell-quoted command for logs/results.
+
+    Masks values following -p/--password and inline --password=.
+    """
+    redacted: List[str] = []
+    skip_next = False
+    for i, tok in enumerate(cmd):
+        if skip_next:
+            redacted.append("***")
+            skip_next = False
+            continue
+        if tok in ("-p", "--password"):
+            redacted.append(tok)
+            skip_next = True
+            continue
+        if tok.startswith("--password="):
+            redacted.append("--password=***")
+            continue
+        redacted.append(tok)
+    return execs.format_command(redacted)
+
+
+async def _try_cmd_variants(
+    variants: List[List[str]],
+    tty: bool = False,
+    timeout: int = 60,
+):
+    """
+    Try a list of command variants, returning the first result and the used cmd.
+    If a variant fails with an 'unknown command/flag' style error, try the next.
+    Otherwise, return that failure.
+    """
+    last_res = None
+    for cmd in variants:
+        res = await (execs.run_cmd_tty_async(cmd, timeout=timeout) if tty else execs.run_cmd_async(cmd, timeout=timeout))
+        if res.exit_code == 0:
+            return res, cmd
+        stderr = (res.stderr or "").lower()
+        if "unknown command" in stderr or "unknown flag" in stderr or "unknown shorthand flag" in stderr:
+            last_res = res
+            continue
+        return res, cmd
+    # If all variants failed with unknown errors, return the last
+    return last_res or await execs.run_cmd_async(variants[-1], timeout=timeout), variants[-1]
 
 
 def _step_timeout(step: str) -> int:

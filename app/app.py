@@ -81,6 +81,9 @@ async def submit_bootstrap_job(payload: Dict[str, Any]):
         "operators": payload.get("operators") or {},
         "take_ownership": bool(payload.get("take_ownership", False)),
         "resources": payload.get("resources") or {},
+        # Optional: account password for everestctl accounts create
+        # Not logged; only used to pass to CLI.
+        "password": payload.get("password"),
     }
 
     job = await job_store.create_job(inputs)
@@ -113,7 +116,7 @@ async def get_job_result(job_id: str):
 @app.get("/accounts/list", dependencies=[Depends(require_admin_key)])
 async def accounts_list():
     # Intentionally using singular per instruction: `everestctl account list`
-    cmd = ["everestctl", "--json", "account", "list"]
+    cmd = ["everestctl", "--json", "accounts", "list"]
     res = await execs.run_cmd_async(cmd)  # type: ignore[arg-type]
     logger.info(
         f"request accounts_list exit={res.exit_code} stderr_tail={(res.stderr or '').strip()[-200:]}"
