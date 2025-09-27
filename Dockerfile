@@ -17,14 +17,34 @@ RUN set -eux; \
     chmod +x /usr/local/bin/kubectl; \
     kubectl version --client=true --short || true
 
-# Install everestctl
-# Preferred: official binary placed at /usr/local/bin/everestctl then chmod +x
-# Example (adjust URL/version as needed):
-# RUN curl -L -o /usr/local/bin/everestctl https://example.com/everestctl/linux/amd64/everestctl \
-#     && chmod +x /usr/local/bin/everestctl \
-#     && everestctl --version || true
-# Fallback: pip install (ensure it provides the CLI)
-RUN pip install --no-cache-dir everestctl || true
+# Install everestctl (linux/amd64) from percona/everest releases only
+# Usage: optionally pass build-arg EVERESTCTL_VERSION (e.g., v0.8.0). If not set, pulls latest.
+ARG EVERESTCTL_VERSION=""
+RUN set -eux; \
+    BASE="https://github.com/percona/everest/releases"; \
+    if [ -n "$EVERESTCTL_VERSION" ]; then \
+      DL="$BASE/download/${EVERESTCTL_VERSION}"; \
+    else \
+      DL="$BASE/latest/download"; \
+    fi; \
+    echo "Downloading everestctl (linux/amd64) from $DL"; \
+    mkdir -p /tmp/everest-dl; cd /tmp/everest-dl; \
+    set +e; \
+    for asset in "everestctl-linux-amd64" "everestctl-amd64" "everestctl"; do \
+      url="$DL/$asset"; \
+      echo "Trying: $url"; \
+      if curl -fsSL -o everestctl.bin "$url"; then \
+        echo "Downloaded $asset"; \
+        break; \
+      fi; \
+    done; \
+    set -e; \
+    if [ ! -s everestctl.bin ]; then \
+      echo "Failed to download everestctl from percona/everest releases. Set EVERESTCTL_VERSION to a valid tag."; \
+      exit 1; \
+    fi; \
+    install -m 0755 everestctl.bin /usr/local/bin/everestctl; \
+    /usr/local/bin/everestctl --version || true
 
 WORKDIR /app
 COPY requirements.txt ./
@@ -38,4 +58,3 @@ USER 10001
 EXPOSE 8080
 
 CMD ["uvicorn", "app.app:app", "--host", "0.0.0.0", "--port", "8080"]
-
