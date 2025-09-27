@@ -142,3 +142,35 @@ class RotatePasswordRequest(BaseModel):
     new_password: str
     _val_user = field_validator("username")(_validate_k8s_name)
 
+
+# Templates
+class TemplateDefaults(BaseModel):
+    username: Optional[str] = None
+    password: Optional[str] = None
+    namespace: Optional[str] = None
+
+
+class TemplateOperators(OperatorsModel):
+    take_ownership: Optional[bool] = False
+
+
+class TemplateBlueprint(BaseModel):
+    defaults: Optional[TemplateDefaults] = None
+    operators: Optional[TemplateOperators] = None
+    limits: Optional[LimitsUpsertRequest] = None
+    rbac_extra: Optional[List[str]] = None
+
+
+class TemplateCreateRequest(BaseModel):
+    name: str
+    blueprint: TemplateBlueprint
+
+
+class TemplateUseRequest(BaseModel):
+    template: str
+    username: Optional[str] = None
+    password: Optional[str] = None
+    namespace: Optional[str] = None
+    operators: Optional[TemplateOperators] = None
+    limits: Optional[LimitsUpsertRequest] = None
+    idempotency_key: Optional[str] = None

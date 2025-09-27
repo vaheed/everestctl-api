@@ -20,6 +20,8 @@ from schemas import (
     AccountsDelete,
     AccountsSetPassword,
     BootstrapTenantRequest,
+    TemplateCreateRequest,
+    TemplateUseRequest,
     EnforceClusterCreateRequest,
     LimitsUpsertRequest,
     NamespacesAddRequest,
@@ -189,6 +191,174 @@ def bootstrap_tenant(
     result = {"status": "ok", "namespace": ns, "username": user}
     if key:
         db.idempotency_put(key, "application/json", 200, result)
+    return result
+
+
+# Templates CRUD
+@app.post("/templates")
+def create_template(req: TemplateCreateRequest, _: Any = Depends(require_key_dep)):
+    bp = req.blueprint.model_dump(exclude_none=True)
+    # Validate RBAC lines if provided
+    if bp.get("rbac_extra"):
+        validate_policy_lines(bp["rbac_extra"])  # structure only; placeholders allowed
+    db.upsert_template(req.name, bp)
+    return {"status": "ok", "name": req.name}
+
+
+@app.get("/templates")
+def list_templates(_: Any = Depends(require_key_dep)):
+    return db.list_templates()
+
+
+@app.get("/templates/{name}")
+def get_template(name: str, _: Any = Depends(require_key_dep)):
+    bp = db.get_template(name)
+    if not bp:
+        raise HTTPException(status_code=404, detail="not found")
+    return {"name": name, "blueprint": bp}
+
+
+@app.delete("/templates/{name}")
+def delete_template(name: str, _: Any = Depends(require_key_dep)):
+    ok = db.delete_template(name)
+    if not ok:
+        raise HTTPException(status_code=404, detail="not found")
+    return {"status": "deleted", "name": name}
+
+
+def _merge_template_and_overrides(tpl: Dict[str, Any], use: TemplateUseRequest) -> Dict[str, Any]:
+    # Resolve username/password/namespace
+    username = use.username or (tpl.get("defaults", {}).get("username") if tpl.get("defaults") else None)
+    password = use.password or (tpl.get("defaults", {}).get("password") if tpl.get("defaults") else None)
+    namespace = use.namespace or (tpl.get("defaults", {}).get("namespace") if tpl.get("defaults") else None)
+    if not username or not password or not namespace:
+        raise HTTPException(status_code=400, detail="username, password, and namespace must be provided via template defaults or overrides")
+    # Operators
+    operators = {
+        "postgresql": False,
+        "mongodb": False,
+        "xtradb_cluster": False,
+    }
+    if tpl.get("operators"):
+        op = tpl["operators"]
+        operators.update({
+            "postgresql": bool(op.get("postgresql", False)),
+            "mongodb": bool(op.get("mongodb", False)),
+            "xtradb_cluster": bool(op.get("xtradb_cluster", False)),
+        })
+        take_ownership = bool(op.get("take_ownership", False))
+    else:
+        take_ownership = False
+    if use.operators is not None:
+        opu = use.operators.model_dump(exclude_none=True)
+        operators.update({
+            "postgresql": bool(opu.get("postgresql", operators["postgresql"])),
+            "mongodb": bool(opu.get("mongodb", operators["mongodb"])),
+            "xtradb_cluster": bool(opu.get("xtradb_cluster", operators["xtradb_cluster"])),
+        })
+        take_ownership = bool(opu.get("take_ownership", take_ownership))
+
+    # Limits
+    limits = None
+    if tpl.get("limits"):
+        limits = tpl["limits"]
+    if use.limits is not None:
+        limits = use.limits.model_dump()
+    # If limits not set, keep None (will fallback to defaults in flow)
+
+    # Extra RBAC lines with placeholders
+    rbac_extra = tpl.get("rbac_extra", [])
+    formatted_rbac = []
+    for line in rbac_extra:
+        try:
+            formatted_rbac.append(line.format(username=username, namespace=namespace))
+        except Exception:
+            formatted_rbac.append(line)
+    return {
+        "username": username,
+        "password": password,
+        "namespace": namespace,
+        "operators": operators,
+        "take_ownership": take_ownership,
+        "limits": limits,
+        "rbac_extra": formatted_rbac,
+    }
+
+
+@app.post("/bootstrap/from-template")
+def bootstrap_from_template(
+    req: TemplateUseRequest,
+    _: Any = Depends(require_key_dep),
+    __: Any = Depends(rate_limit_dep),
+    key: Optional[str] = Depends(idempotency_dep),
+):
+    tpl = db.get_template(req.template)
+    if not tpl:
+        raise HTTPException(status_code=404, detail="template not found")
+    merged = _merge_template_and_overrides(tpl, req)
+    ns = merged["namespace"]
+    user = merged["username"]
+    # 1) namespace add
+    code, out, err = cli.namespaces_add(
+        ns,
+        merged["operators"],
+        take_ownership=bool(merged.get("take_ownership", False)),
+    )
+    if code != 0 and "already exists" not in (out + err).lower():
+        db.write_audit("admin", "namespaces_add", ns, user, None, 500, "namespaces add", code, out, err)
+        raise HTTPException(status_code=500, detail=f"namespaces add failed: {err}")
+    # 2) accounts create (idempotent)
+    code, out, err = cli.accounts_create(user)
+    if code != 0 and "already exists" not in (out + err).lower():
+        db.write_audit("admin", "accounts_create", ns, user, None, 500, "accounts create", code, out, err)
+        raise HTTPException(status_code=500, detail=f"account create failed: {err}")
+    # 3) set password
+    code, out, err = cli.accounts_set_password(user, merged["password"])
+    if code != 0:
+        db.write_audit("admin", "accounts_set_password", ns, user, None, 500, "accounts set-password", code, out, err)
+        raise HTTPException(status_code=500, detail=f"set password failed: {err}")
+    # 4) RBAC base + extra
+    role = f"role:tenant-{ns}"
+    lines = [
+        f"p, {role}, namespaces, read, {ns}",
+        f"p, {role}, database-engines, read, {ns}/*",
+        f"p, {role}, database-clusters, *, {ns}/*",
+        f"p, {role}, database-cluster-backups, *, {ns}/*",
+        f"p, {role}, database-cluster-restores, *, {ns}/*",
+        f"p, {role}, database-cluster-credentials, read, {ns}/*",
+        f"p, {role}, backup-storages, *, {ns}/*",
+        f"p, {role}, monitoring-instances, *, {ns}/*",
+        f"g, {user}, {role}",
+    ]
+    extra = merged.get("rbac_extra", [])
+    if extra:
+        lines.extend(extra)
+    validate_policy_lines(lines)
+    append_policy_lines(POLICY_FILE, lines)
+    if APPLY_RBAC:
+        vcode, vout, verr = cli.rbac_validate(POLICY_FILE)
+        if vcode != 0:
+            db.write_audit("admin", "rbac_validate", ns, user, None, 500, "rbac validate", vcode, vout, verr)
+            raise HTTPException(status_code=500, detail=f"rbac validate failed: {verr}")
+    # 5) Limits / CRD
+    limits = merged.get("limits") or {
+        "namespace": ns,
+        "max_clusters": 3,
+        "allowed_engines": ["postgresql", "mysql"],
+        "cpu_limit_cores": 4.0,
+        "memory_limit_bytes": 17179869184,
+        "max_db_users": 20,
+    }
+    try:
+        upsert_tenant_resource_policy(ns, limits, limits.get("allowed_engines", []))
+    except Exception as e:
+        logger.warning("crd upsert failed: %s", e)
+    db.upsert_limits(ns, limits)
+    db.init_usage_if_missing(ns)
+
+    result = {"status": "ok", "namespace": ns, "username": user, "template": req.template}
+    if req.idempotency_key:
+        db.idempotency_put(req.idempotency_key, "application/json", 200, result)
     return result
 
 

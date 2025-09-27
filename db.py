@@ -80,6 +80,16 @@ class Database:
             );
             """
         )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS templates (
+              name TEXT PRIMARY KEY,
+              blueprint TEXT NOT NULL,
+              created_at INTEGER,
+              updated_at INTEGER
+            );
+            """
+        )
         self._conn.commit()
 
     @contextmanager
@@ -276,3 +286,31 @@ class Database:
             )
         return out
 
+    # Templates
+    def upsert_template(self, name: str, blueprint: Dict[str, Any]):
+        with self.tx() as cur:
+            cur.execute(
+                """
+                INSERT INTO templates(name, blueprint, created_at, updated_at)
+                VALUES(?,?,?,?)
+                ON CONFLICT(name) DO UPDATE SET blueprint=excluded.blueprint, updated_at=excluded.updated_at
+                """,
+                (name, json.dumps(blueprint), int(time.time()), int(time.time())),
+            )
+
+    def get_template(self, name: str) -> Optional[Dict[str, Any]]:
+        cur = self._conn.cursor()
+        row = cur.execute("SELECT blueprint FROM templates WHERE name=?", (name,)).fetchone()
+        if not row:
+            return None
+        return json.loads(row[0])
+
+    def delete_template(self, name: str) -> bool:
+        with self.tx() as cur:
+            cur.execute("DELETE FROM templates WHERE name=?", (name,))
+            return cur.rowcount > 0
+
+    def list_templates(self):
+        cur = self._conn.cursor()
+        rows = cur.execute("SELECT name, blueprint FROM templates ORDER BY name").fetchall()
+        return [{"name": r[0], "blueprint": json.loads(r[1] or "{}")} for r in rows]

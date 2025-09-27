@@ -79,6 +79,64 @@ curl -sS -X POST $BASE_URL/bootstrap/tenant \
         "namespace":"ns-bob",
         "operators":{"postgresql":true,"mongodb":true,"xtradb_cluster":false}
       }'
+
+Bootstrap cheat sheet
+- Use Idempotency-Key header to safely retry.
+- Operators: set booleans for `postgresql`, `mongodb`, `xtradb_cluster`.
+- The bootstrap flow creates namespace, user, password, RBAC, CRD limits, and initializes counters.
+
+Direct bootstrap (full example)
+```bash
+curl -sS -X POST $BASE_URL/bootstrap/tenant \
+  -H "X-Admin-Key: $ADMIN_API_KEY" \
+  -H "Idempotency-Key: 33333333-3333-3333-3333-333333333333" \
+  -H "Content-Type: application/json" \
+  -d '{
+        "username": "charlie",
+        "password": "S0meStr0ngP@ss",
+        "namespace": "ns-charlie",
+        "operators": {"postgresql": true, "mongodb": false, "xtradb_cluster": true}
+      }'
+# Example 200 OK response
+# {"status":"ok","namespace":"ns-charlie","username":"charlie"}
+```
+
+Template-based bootstrap
+1) Create a reusable template (includes defaults, operators, limits, extra RBAC)
+```bash
+curl -sS -X POST $BASE_URL/templates \
+  -H "X-Admin-Key: $ADMIN_API_KEY" -H "Content-Type: application/json" \
+  -d '{
+        "name": "standard-tenant",
+        "blueprint": {
+          "defaults": {"username": "tenantuser", "password": "ChangeMeP@ss1", "namespace": "ns-tenant"},
+          "operators": {"postgresql": true, "mongodb": false, "xtradb_cluster": false, "take_ownership": false},
+          "limits": {"namespace":"ns-tenant","max_clusters":3,"allowed_engines":["postgresql","mysql"],"cpu_limit_cores":4,"memory_limit_bytes":17179869184,"max_db_users":20},
+          "rbac_extra": [
+            "p, role:tenant-{namespace}, backup-storages, create, {namespace}/*",
+            "g, {username}, role:tenant-{namespace}"
+          ]
+        }
+      }'
+```
+
+2) Bootstrap a tenant from the template, overriding identity and limits
+```bash
+curl -sS -X POST $BASE_URL/bootstrap/from-template \
+  -H "X-Admin-Key: $ADMIN_API_KEY" \
+  -H "Idempotency-Key: 44444444-4444-4444-4444-444444444444" \
+  -H "Content-Type: application/json" \
+  -d '{
+        "template": "standard-tenant",
+        "username": "dana",
+        "password": "AnotherStrongP@ss",
+        "namespace": "ns-dana",
+        "operators": {"postgresql": true, "mongodb": true, "xtradb_cluster": false, "take_ownership": true},
+        "limits": {"namespace":"ns-dana","max_clusters":5,"allowed_engines":["postgresql","mongodb"],"cpu_limit_cores":8,"memory_limit_bytes":34359738368,"max_db_users":40}
+      }'
+# Example 200 OK response
+# {"status":"ok","namespace":"ns-dana","username":"dana","template":"standard-tenant"}
+```
 ```
 
 Accounts (API wrappers)

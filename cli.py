@@ -1,5 +1,6 @@
 import logging
 import os
+import select
 import shlex
 import subprocess
 import time
@@ -76,9 +77,7 @@ def run(
         start = time.time()
         try:
             if use_pty:
-                import os
-                import select
-
+                
                 master, slave = os.openpty()
                 try:
                     proc = subprocess.Popen(
