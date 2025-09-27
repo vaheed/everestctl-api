@@ -4,11 +4,47 @@ FROM python:3.12-slim AS base
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-# Install tini and helpful tools
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates tini && rm -rf /var/lib/apt/lists/*
+# Image includes:
+#  - tini (init)
+#  - kubectl (pinned/overrideable)
+#  - everestctl (latest by default or pinned via build-arg)
 
-# Everestctl: provide the binary at runtime via volume or bake your own image
-# with the binary placed at /usr/local/bin/everestctl.
+# Install tini and helpful tools
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates tini curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install kubectl
+# Set KUBECTL_VERSION to a specific tag like v1.30.4 for reproducible builds
+ARG KUBECTL_VERSION=stable
+RUN set -eux; \
+    arch="$(dpkg --print-architecture)"; \
+    if [ "$KUBECTL_VERSION" = "stable" ]; then \
+      ver="$(curl -fsSL https://dl.k8s.io/release/stable.txt)"; \
+    else \
+      ver="$KUBECTL_VERSION"; \
+    fi; \
+    curl -fsSLo /usr/local/bin/kubectl "https://dl.k8s.io/release/${ver}/bin/linux/${arch}/kubectl"; \
+    chmod +x /usr/local/bin/kubectl; \
+    kubectl version --client=true --output=yaml >/dev/null 2>&1 || true
+
+# Install everestctl (Percona Everest CLI)
+# EVERESTCTL_VERSION accepts values like v0.11.0 or 'latest'
+ARG EVERESTCTL_VERSION=latest
+RUN set -eux; \
+    arch="$(dpkg --print-architecture)"; \
+    case "$arch" in amd64|arm64) ;; *) echo "unsupported arch: $arch"; exit 1;; esac; \
+    base="https://github.com/percona/percona-everest/releases"; \
+    if [ "$EVERESTCTL_VERSION" = "latest" ]; then \
+      url="$base/latest/download/everestctl-linux-$arch"; \
+    else \
+      url="$base/download/$EVERESTCTL_VERSION/everestctl-linux-$arch"; \
+    fi; \
+    curl -fsSLo /usr/local/bin/everestctl "$url"; \
+    chmod +x /usr/local/bin/everestctl; \
+    /usr/local/bin/everestctl version >/dev/null 2>&1 || true
+
+# everestctl and kubectl are installed at /usr/local/bin
 
 WORKDIR /app
 COPY requirements.txt .

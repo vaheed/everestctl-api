@@ -21,9 +21,21 @@ cp .env.example .env
 docker compose up --build
 ```
 
-To provide `everestctl` inside the container, either:
-- Mount the binary at runtime (easiest with Compose): add `./everestctl:/usr/local/bin/everestctl` under `volumes`.
-- Or bake a custom image that copies your binary to `/usr/local/bin/everestctl`.
+The image already includes `kubectl` and `everestctl` in `/usr/local/bin`.
+You only need to provide a kubeconfig via the compose mount.
+
+Kubeconfig: everestctl requires a kubeconfig. The compose files mount `${HOME}/.kube/config` from the host to `/data/kubeconfig` and set `KUBECONFIG=/data/kubeconfig`. You can override the host path via `KUBECONFIG_HOST_PATH` in `.env`.
+
+### Pinning tool versions at build time
+
+By default, the Dockerfile installs `kubectl` at the latest stable release and `everestctl` at the latest GitHub release. You can pin them using build args:
+
+```bash
+docker build \
+  --build-arg KUBECTL_VERSION=v1.30.4 \
+  --build-arg EVERESTCTL_VERSION=v0.11.0 \
+  -t ghcr.io/vaheed/everestctl-api:custom .
+```
 
 ## Production Image (GHCR)
 
