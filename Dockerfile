@@ -31,17 +31,25 @@ RUN set -eux; \
 # Install everestctl (Percona Everest CLI)
 # EVERESTCTL_VERSION accepts values like v0.11.0 or 'latest'
 ARG EVERESTCTL_VERSION=latest
+ARG EVERESTCTL_REPO=percona/everest
+ENV EVERESTCTL_REPO=${EVERESTCTL_REPO}
 RUN set -eux; \
     arch="$(dpkg --print-architecture)"; \
-    case "$arch" in amd64|arm64) ;; *) echo "unsupported arch: $arch"; exit 1;; esac; \
-    base="https://github.com/percona/percona-everest/releases"; \
+    case "$arch" in \
+      amd64) rel_arch="amd64" ;; \
+      arm64) rel_arch="arm64" ;; \
+      *) echo "unsupported arch: $arch"; exit 1 ;; \
+    esac; \
+    base="https://github.com/${EVERESTCTL_REPO}/releases"; \
     if [ "$EVERESTCTL_VERSION" = "latest" ]; then \
-      url="$base/latest/download/everestctl-linux-$arch"; \
+      url="$base/latest/download/everestctl-linux-$rel_arch"; \
     else \
-      url="$base/download/$EVERESTCTL_VERSION/everestctl-linux-$arch"; \
+      url="$base/download/$EVERESTCTL_VERSION/everestctl-linux-$rel_arch"; \
     fi; \
-    curl -fsSLo /usr/local/bin/everestctl "$url"; \
-    chmod +x /usr/local/bin/everestctl; \
+    echo "Downloading everestctl from: $url"; \
+    curl -fLSo /tmp/everestctl "$url"; \
+    install -m 0555 /tmp/everestctl /usr/local/bin/everestctl; \
+    rm -f /tmp/everestctl; \
     /usr/local/bin/everestctl version >/dev/null 2>&1 || true
 
 # everestctl and kubectl are installed at /usr/local/bin

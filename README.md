@@ -21,19 +21,20 @@ cp .env.example .env
 docker compose up --build
 ```
 
-The image already includes `kubectl` and `everestctl` in `/usr/local/bin`.
+The image already includes `kubectl` and `everestctl`.
 You only need to provide a kubeconfig via the compose mount.
 
-Kubeconfig: everestctl requires a kubeconfig. The compose files mount `${HOME}/.kube/config` from the host to `/data/kubeconfig` and set `KUBECONFIG=/data/kubeconfig`. You can override the host path via `KUBECONFIG_HOST_PATH` in `.env`.
+Kubeconfig: everestctl requires a kubeconfig. The compose files mount your host kubeconfig and set the appropriate environment so the CLI can use it. You can override the host path via `KUBECONFIG_HOST_PATH` in `.env`.
 
 ### Pinning tool versions at build time
 
-By default, the Dockerfile installs `kubectl` at the latest stable release and `everestctl` at the latest GitHub release. You can pin them using build args:
+By default, the Dockerfile installs `kubectl` at the latest stable release and `everestctl` at the latest GitHub release. You can pin or override them using build args:
 
 ```bash
 docker build \
   --build-arg KUBECTL_VERSION=v1.30.4 \
   --build-arg EVERESTCTL_VERSION=v0.11.0 \
+  --build-arg EVERESTCTL_REPO=percona/everest \
   -t ghcr.io/vaheed/everestctl-api:custom .
 ```
 
@@ -56,7 +57,7 @@ docker compose -f docker-compose.prod.yml up -d
 | Variable | Default | Description |
 |---|---|---|
 | `API_KEY` | required | Shared secret for `X-API-Key` header |
-| `EVERESTCTL_PATH` | `/usr/local/bin/everestctl` | CLI path |
+| `EVERESTCTL_PATH` | internal default | CLI path |
 | `RBAC_POLICY_PATH` | `/data/policy.csv` | Policy file path |
 | `DB_PATH` | `/data/audit.db` | SQLite DB path |
 | `DB_URL` | empty | Optional Postgres URL (e.g., `postgresql://user:pass@host:5432/db`). If set, overrides SQLite and uses Postgres for audit/counters. |
@@ -127,6 +128,7 @@ curl -s localhost:8080/metrics
 ## Notes on `everestctl`
 
 The app invokes `everestctl` using safe, argument-validated subprocess calls. Adjust the exact subcommands in `app.py` under the `create_tenant` / `delete_tenant` / `rotate_password` endpoints to match your CLI semantics.
+If you need the CLI on your host, follow the official Everest documentation for installation steps appropriate to your platform.
 
 ## Development
 
