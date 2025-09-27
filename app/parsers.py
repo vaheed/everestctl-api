@@ -1,49 +1,51 @@
-from __future__ import annotations
-
 import json
 import re
 from typing import Any, Dict, List
 
 
-def try_parse_json_or_table(stdout: str) -> Dict[str, Any]:
+def parse_accounts_output(text: str) -> Dict[str, Any]:
     """
-    Try to parse stdout as JSON; if fails, parse as whitespace/pipe-separated table.
-    Returns a dict: {"data": <parsed>} where parsed is either a list or json.
+    Try to parse everestctl accounts list output.
+    - If JSON, return {"data": parsed}
+    - If tabular, convert to list[dict]
     """
-    s = (stdout or "").strip()
-    if not s:
+    text = text.strip()
+    if not text:
         return {"data": []}
     # Try JSON
     try:
-        data = json.loads(s)
+        data = json.loads(text)
         return {"data": data}
     except json.JSONDecodeError:
         pass
 
-    # Parse table: detect header row (first non-empty line)
-    lines = [ln for ln in s.splitlines() if ln.strip()]
+    # Try pipe-separated table
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     if not lines:
         return {"data": []}
 
-    header = _split_table_row(lines[0])
-    rows = []
+    # Detect header splitters
+    if "|" in lines[0]:
+        headers = [h.strip().lower().replace(" ", "_") for h in lines[0].split("|") if h.strip()]
+        rows = []
+        for ln in lines[1:]:
+            parts = [p.strip() for p in ln.split("|") if p.strip()]
+            if len(parts) != len(headers):
+                continue
+            rows.append({headers[i]: parts[i] for i in range(len(headers))})
+        return {"data": rows}
+
+    # Fallback: whitespace columns. Use multiple spaces as separator.
+    splitter = re.compile(r"\s{2,}")
+    headers = [h.strip().lower().replace(" ", "_") for h in splitter.split(lines[0]) if h.strip()]
+    rows: List[Dict[str, Any]] = []
     for ln in lines[1:]:
-        parts = _split_table_row(ln)
-        # pad or trim to header length
-        if len(parts) < len(header):
-            parts += [""] * (len(header) - len(parts))
-        elif len(parts) > len(header):
-            parts = parts[: len(header)]
-        rows.append({header[i]: parts[i] for i in range(len(header))})
+        parts = [p.strip() for p in splitter.split(ln) if p.strip()]
+        if len(parts) != len(headers):
+            # try single spaces split as last resort
+            parts = ln.split()
+            if len(parts) != len(headers):
+                continue
+        rows.append({headers[i]: parts[i] for i in range(len(headers))})
     return {"data": rows}
-
-
-def _split_table_row(line: str) -> List[str]:
-    # Split by consecutive 2+ spaces, tabs, or pipes with optional spaces
-    # Then strip each cell
-    # Example formats:
-    # NAME    ID   STATUS
-    # alice | 123 | active
-    parts = re.split(r"\s{2,}|\t+|\s*\|\s*", line.strip())
-    return [p.strip() for p in parts if p.strip() != "-"]
 

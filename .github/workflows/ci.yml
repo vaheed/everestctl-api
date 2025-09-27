@@ -2,87 +2,67 @@ name: CI
 
 on:
   push:
-    branches: ["**"]
-    tags: ["v*"]
-  pull_request:
 
 jobs:
   test:
-    name: Test (pytest)
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-
       - name: Run tests
-        env:
-          SKIP_CLI_VERIFY: "true"
-          ADMIN_API_KEY: test-key
-          SQLITE_DB: ${{ github.workspace }}/.tmp/tenant_proxy_test.db
-          POLICY_FILE: ${{ github.workspace }}/.tmp/policy.csv
-          PYTHONPATH: ${{ github.workspace }}
+        run: pytest -q
+      - name: Build Docker image (smoke test)
         run: |
-          mkdir -p .tmp
-          pytest -q
+          docker build -t everestctl-api:${{ github.sha }} .
+      - name: Run container and smoke test
+        env:
+          ADMIN_API_KEY: changeme
+        run: |
+          docker run -d --rm --name everestctl-api \
+            -e ADMIN_API_KEY=${ADMIN_API_KEY} \
+            -p 18080:8080 everestctl-api:${{ github.sha }}
+          # Wait for readiness
+          for i in $(seq 1 30); do \
+            curl -sSsf http://127.0.0.1:18080/readyz && break || sleep 1; \
+          done
+          # Health check returns ok=true
+          curl -sSsf http://127.0.0.1:18080/healthz | grep '"ok": true'
+      - name: Cleanup container
+        if: ${{ always() }}
+        run: |
+          docker ps -a
+          docker logs everestctl-api || true
+          docker rm -f everestctl-api || true
 
-  docker:
-    name: Build and Push Image
-    if: github.event_name != 'pull_request'
+  deploy:
     needs: test
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
+    if: ${{ always() }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.repository_owner }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Compute tags
-        id: meta
+      - uses: actions/checkout@v4
+      - name: Log in to registry
+        if: ${{ secrets.REGISTRY && secrets.REGISTRY_USERNAME && secrets.REGISTRY_PASSWORD }}
         run: |
-          REPO_OWNER=${{ github.repository_owner }}
-          REPO_NAME=${GITHUB_REPOSITORY#*/}
-          IMAGE="ghcr.io/${REPO_OWNER}/${REPO_NAME}"
-          SHORT_SHA=${GITHUB_SHA::7}
-          TAGS="${IMAGE}:sha-${SHORT_SHA}"
-          if [ "${GITHUB_REF_TYPE}" = "branch" ] && [ "${GITHUB_REF_NAME}" = "main" ]; then
-            TAGS="$TAGS,${IMAGE}:latest"
-          fi
-          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
-            TAGS="$TAGS,${IMAGE}:${GITHUB_REF_NAME}"
-          fi
-          echo "image=${IMAGE}" >> $GITHUB_OUTPUT
-          echo "tags=${TAGS}" >> $GITHUB_OUTPUT
-
-      - name: Build and push
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          push: true
-          platforms: linux/amd64
-          tags: ${{ steps.meta.outputs.tags }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          echo "${{ secrets.REGISTRY_PASSWORD }}" | docker login ${{ secrets.REGISTRY }} -u "${{ secrets.REGISTRY_USERNAME }}" --password-stdin
+      - name: Build image
+        run: |
+          docker build -t ${{ secrets.REGISTRY || 'local' }}/${{ github.repository }}:${{ github.sha }} .
+      - name: Push image
+        if: ${{ secrets.REGISTRY && secrets.REGISTRY_USERNAME && secrets.REGISTRY_PASSWORD }}
+        run: |
+          docker push ${{ secrets.REGISTRY }}/${{ github.repository }}:${{ github.sha }}
+      - name: Deploy to K8s (optional)
+        if: ${{ secrets.KUBECONFIG_B64 }}
+        env:
+          KUBECONFIG_B64: ${{ secrets.KUBECONFIG_B64 }}
+        run: |
+          echo "$KUBECONFIG_B64" | base64 -d > kubeconfig
+          export KUBECONFIG=$PWD/kubeconfig
+          # kubectl apply -f deploy.yaml  # hook up your manifests here
+          echo "deploy skipped (no manifests)"

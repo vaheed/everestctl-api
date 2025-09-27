@@ -1,22 +1,32 @@
-from __future__ import annotations
+import os
+from typing import Dict, List
 
-from typing import Dict
 
-
-def build_quota_and_limits_yaml(namespace: str, cpu_cores: int, ram_mb: int, disk_gb: int) -> str:
+def build_quota_limitrange_yaml(namespace: str, resources: Dict[str, int]) -> str:
     """
-    Build a multi-document YAML with ResourceQuota and LimitRange.
-    Keep simple and deterministic string-based YAML (no PyYAML dependency).
-    """
-    # Defaults for LimitRange requests/limits per container
-    # Choose conservative defaults: requests = 25% of quota, limits = 50% of quota
-    # rounded down to at least 1 for CPU and minimal memory.
-    req_cpu = max(1, max(1, cpu_cores // 4))
-    lim_cpu = max(1, max(1, cpu_cores // 2))
-    req_mem = max(256, max(256, (ram_mb // 4)))  # Mi
-    lim_mem = max(512, max(512, (ram_mb // 2)))
+    Build a combined YAML for ResourceQuota and LimitRange.
 
-    quota = f"""
+    resources expects keys: cpu_cores, ram_mb, disk_gb
+    """
+    cpu = int(resources.get("cpu_cores", 2))
+    ram_mb = int(resources.get("ram_mb", 2048))
+    disk_gb = int(resources.get("disk_gb", 20))
+    max_dbs = resources.get("max_databases")
+
+    # Parse optional DB count resources to enforce via ResourceQuota count/<resource>
+    # Comma-separated list, e.g.:
+    #   perconaservermongodbs.psmdb.percona.com,perconapgclusters.pgv2.percona.com,perconaxtradbclusters.pxc.percona.com
+    count_resources_env = os.environ.get("EVEREST_DB_COUNT_RESOURCES", "").strip()
+    count_resources: List[str] = [r.strip() for r in count_resources_env.split(",") if r.strip()]
+
+    # Simple defaults for LimitRange (per container)
+    limitrange = {
+        "defaultRequest": {"cpu": "1", "memory": "512Mi"},
+        "default": {"cpu": "1", "memory": "1024Mi"},
+    }
+
+    # Base quota with CPU/memory/storage
+    quota_yaml = f"""
 apiVersion: v1
 kind: ResourceQuota
 metadata:
@@ -24,14 +34,26 @@ metadata:
   namespace: {namespace}
 spec:
   hard:
-    requests.cpu: "{cpu_cores}"
+    requests.cpu: "{cpu}"
     requests.memory: "{ram_mb}Mi"
     requests.storage: "{disk_gb}Gi"
-    limits.cpu: "{cpu_cores}"
+    limits.cpu: "{cpu}"
     limits.memory: "{ram_mb}Mi"
 """.strip()
 
-    limit_range = f"""
+    # Append count quotas if configured
+    if max_dbs is not None and count_resources:
+        try:
+            max_dbs_int = int(max_dbs)
+        except Exception:
+            max_dbs_int = None
+        if max_dbs_int is not None and max_dbs_int >= 0:
+            count_lines = []
+            for res in count_resources:
+                count_lines.append(f"    count/{res}: \"{max_dbs_int}\"")
+            quota_yaml = quota_yaml + "\n" + "\n".join(count_lines)
+
+    limitrange_yaml = f"""
 apiVersion: v1
 kind: LimitRange
 metadata:
@@ -41,12 +63,18 @@ spec:
   limits:
   - type: Container
     defaultRequest:
-      cpu: "{req_cpu}"
-      memory: "{req_mem}Mi"
+      cpu: "{limitrange['defaultRequest']['cpu']}"
+      memory: "{limitrange['defaultRequest']['memory']}"
     default:
-      cpu: "{lim_cpu}"
-      memory: "{lim_mem}Mi"
+      cpu: "{limitrange['default']['cpu']}"
+      memory: "{limitrange['default']['memory']}"
 """.strip()
 
-    return f"{quota}\n---\n{limit_range}\n"
+    return quota_yaml + "\n---\n" + limitrange_yaml + "\n"
 
+
+def build_scale_statefulsets_cmd(namespace: str) -> List[str]:
+    """
+    Return a kubectl command to scale down all StatefulSets in a namespace to 0.
+    """
+    return ["kubectl", "scale", "statefulset", "--all", "-n", namespace, "--replicas=0"]

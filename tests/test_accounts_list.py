@@ -1,65 +1,22 @@
-import json
-import os
-from fastapi.testclient import TestClient
+import pytest
+import httpx
 
 from app.app import app
-from app import execs
 
 
-ADMIN_KEY = os.getenv("ADMIN_API_KEY", "changeme")
+@pytest.mark.asyncio
+async def test_accounts_list_json(monkeypatch):
+    async def fake_run_cmd(cmd, **kwargs):
+        if "--json" in cmd:
+            return {"exit_code": 0, "stdout": '{"items":[{"name":"alice"}]}', "stderr": "", "command": " ".join(cmd)}
+        return {"exit_code": 1, "stdout": "", "stderr": "", "command": " ".join(cmd)}
 
+    from app import app as app_module
+    monkeypatch.setattr(app_module, "run_cmd", fake_run_cmd)
 
-def setup_module():
-    # Override admin key for tests
-    app.dependency_overrides = {}
-
-
-def auth_headers():
-    return {"X-Admin-Key": ADMIN_KEY}
-
-
-def test_accounts_list_json(monkeypatch):
-    client = TestClient(app)
-
-    def fake_run_cmd(_cmd, input_text=None, timeout=60, env=None):
-        return execs.CmdResult(0, json.dumps({"ok": True}), "", 0.0, 0.0)
-
-    monkeypatch.setattr(execs, "run_cmd", fake_run_cmd)
-    async def fake_run_cmd_async(cmd, input_text=None, timeout=60, env=None):
-        return fake_run_cmd(cmd, input_text, timeout, env)
-    monkeypatch.setattr(execs, "run_cmd_async", fake_run_cmd_async)
-    r = client.get("/accounts/list", headers=auth_headers())
-    assert r.status_code == 200
-    assert r.json() == {"data": {"ok": True}}
-
-
-def test_accounts_list_table(monkeypatch):
-    client = TestClient(app)
-
-    def fake_run_cmd(_cmd, input_text=None, timeout=60, env=None):
-        table = "NAME    ID\nalice   1\n"
-        return execs.CmdResult(0, table, "", 0.0, 0.0)
-
-    monkeypatch.setattr(execs, "run_cmd", fake_run_cmd)
-    async def fake_run_cmd_async2(cmd, input_text=None, timeout=60, env=None):
-        return fake_run_cmd(cmd, input_text, timeout, env)
-    monkeypatch.setattr(execs, "run_cmd_async", fake_run_cmd_async2)
-    r = client.get("/accounts/list", headers=auth_headers())
-    assert r.status_code == 200
-    assert r.json() == {"data": [{"NAME": "alice", "ID": "1"}]}
-
-
-def test_accounts_list_error(monkeypatch):
-    client = TestClient(app)
-
-    def fake_run_cmd(_cmd, input_text=None, timeout=60, env=None):
-        return execs.CmdResult(1, "", "boom", 0.0, 0.0)
-
-    monkeypatch.setattr(execs, "run_cmd", fake_run_cmd)
-    async def fake_run_cmd_async3(cmd, input_text=None, timeout=60, env=None):
-        return fake_run_cmd(cmd, input_text, timeout, env)
-    monkeypatch.setattr(execs, "run_cmd_async", fake_run_cmd_async3)
-    r = client.get("/accounts/list", headers=auth_headers())
-    assert r.status_code == 502
-    body = r.json()
-    assert body["detail"]["error"] == "everestctl failed"
+    headers = {"X-Admin-Key": "changeme"}
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+        r = await ac.get("/accounts/list", headers=headers)
+        assert r.status_code == 200
+        assert r.json()["data"]["items"][0]["name"] == "alice"

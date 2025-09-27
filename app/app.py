@@ -1,130 +1,496 @@
-from __future__ import annotations
-
 import asyncio
 import logging
 import os
-import time
-import uuid
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
-from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request, Response
-from fastapi.responses import JSONResponse
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Response, status
+from pydantic import BaseModel, Field
 
-from . import execs
-from .jobs import job_store, run_bootstrap_job
-from .parsers import try_parse_json_or_table
+from .execs import run_cmd
+from .jobs import JobStore, utcnow_iso
+from .k8s import build_quota_limitrange_yaml, build_scale_statefulsets_cmd
+from .parsers import parse_accounts_output
+from .rbac import apply_policy_if_configured, revoke_user_in_rbac_configmap
+from .logging_utils import configure_logging, correlation_middleware
 
+
+configure_logging()
+logger = logging.getLogger("everestctl_api")
 
 ADMIN_API_KEY = os.environ.get("ADMIN_API_KEY", "changeme")
 
-
-def get_logger() -> logging.Logger:
-    logger = logging.getLogger("everestctl_api")
-    if not logger.handlers:
-        handler = logging.StreamHandler()
-        formatter = logging.Formatter(
-            fmt='{"ts": %(asctime)s, "level": "%(levelname)s", "msg": "%(message)s", "logger": "%(name)s"}',
-            datefmt="%Y-%m-%dT%H:%M:%S%z",
-        )
-        handler.setFormatter(formatter)
-        logger.addHandler(handler)
-        logger.setLevel(logging.INFO)
-    return logger
+app = FastAPI(title="Everest Bootstrap API", version="1.0.0")
+# Correlation/JSON access logs
+app.middleware("http")(correlation_middleware)
+jobs = JobStore()
 
 
-logger = get_logger()
-
-app = FastAPI(title="Everestctl Async API", version="1.0.0")
-
-
-@app.middleware("http")
-async def add_request_id(request: Request, call_next):
-    req_id = request.headers.get("X-Request-ID", str(uuid.uuid4()))
-    request.state.request_id = req_id
-    start = time.time()
-    try:
-        response: Response = await call_next(request)
-    finally:
-        dur = time.time() - start
-        logger.info(
-            f"request {request.method} {request.url.path} id={req_id} dur={dur:.3f}s",
-        )
-    response.headers["X-Request-ID"] = req_id
-    return response
-
-
-async def require_admin_key(x_admin_key: Optional[str] = Header(None, alias="X-Admin-Key")):
+async def require_admin_key(x_admin_key: Optional[str] = Header(None, alias="X-Admin-Key")) -> None:
     if not x_admin_key or x_admin_key != ADMIN_API_KEY:
-        raise HTTPException(status_code=401, detail="Unauthorized: missing or invalid X-Admin-Key")
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
+
+
+class OperatorFlags(BaseModel):
+    mongodb: bool = False
+    postgresql: bool = False
+    xtradb_cluster: bool = False
+    mysql: Optional[bool] = None  # newer CLI
+
+
+class Resources(BaseModel):
+    cpu_cores: int = 2
+    ram_mb: int = 2048
+    disk_gb: int = 20
+    # Optional: set a hard cap on the number of database cluster CRs
+    # via ResourceQuota count/<resource> (see EVEREST_DB_COUNT_RESOURCES)
+    max_databases: Optional[int] = None
+
+
+class BootstrapRequest(BaseModel):
+    username: str = Field(..., min_length=1)
+    namespace: Optional[str] = None
+    operators: OperatorFlags = Field(default_factory=OperatorFlags)
+    take_ownership: bool = False
+    resources: Resources = Field(default_factory=Resources)
+
+
+class PasswordChangeRequest(BaseModel):
+    username: str = Field(..., min_length=1)
+    new_password: str = Field(..., min_length=1)
+
+
+class NamespaceResourceUpdate(BaseModel):
+    namespace: str = Field(..., min_length=1)
+    resources: Resources = Field(default_factory=Resources)
+
+
+class NamespaceOperatorsUpdate(BaseModel):
+    namespace: str = Field(..., min_length=1)
+    operators: OperatorFlags = Field(default_factory=OperatorFlags)
+
+
+class SuspendUserRequest(BaseModel):
+    username: str = Field(..., min_length=1)
+    namespace: Optional[str] = None
+    scale_statefulsets: bool = True
+    revoke_rbac: bool = True
+
+
+class DeleteUserRequest(BaseModel):
+    username: str = Field(..., min_length=1)
+    namespace: Optional[str] = None
 
 
 @app.get("/healthz")
 async def healthz():
-    return {"status": "ok"}
+    return {"ok": True, "time": datetime.now(timezone.utc).isoformat()}
 
 
 @app.get("/readyz")
 async def readyz():
-    # Could add additional checks here
-    return {"status": "ready"}
+    return {"ok": True}
 
 
-@app.post("/bootstrap/users", status_code=202, dependencies=[Depends(require_admin_key)])
-async def submit_bootstrap_job(payload: Dict[str, Any]):
-    username = payload.get("username")
-    if not username or not str(username).strip():
-        raise HTTPException(status_code=422, detail="username is required")
+@app.post("/bootstrap/users", status_code=status.HTTP_202_ACCEPTED, dependencies=[Depends(require_admin_key)])
+async def submit_bootstrap(req: BootstrapRequest, background: BackgroundTasks):
+    ns = req.namespace or req.username
+    job = await jobs.create()
+    logger.info(
+        "job created",
+        extra={
+            "event": "job_created",
+            "job_id": job.job_id,
+            "username": req.username,
+            "namespace": ns,
+        },
+    )
 
-    inputs = {
-        "username": str(username).strip(),
-        "namespace": (payload.get("namespace") or str(username).strip()),
-        "operators": payload.get("operators") or {},
-        "take_ownership": bool(payload.get("take_ownership", False)),
-        "resources": payload.get("resources") or {},
-        # Optional: account password for everestctl accounts create
-        # Not logged; only used to pass to CLI.
-        "password": payload.get("password"),
-    }
+    async def _run():
+        await jobs.update(job.job_id, status="running", started_at=utcnow_iso())
+        logger.info(
+            "job started",
+            extra={"event": "job_started", "job_id": job.job_id, "username": req.username, "namespace": ns},
+        )
+        steps = []
+        inputs = {
+            "username": req.username,
+            "namespace": ns,
+            "operators": req.operators.model_dump(),
+            "take_ownership": req.take_ownership,
+            "resources": req.resources.model_dump(),
+        }
 
-    job = await job_store.create_job(inputs)
+        overall_status = "succeeded"
+        summary = []
 
-    async def runner():
-        await run_bootstrap_job(job)
+        try:
+            # Step 1: Create account
+            step1_cmd = ["everestctl", "accounts", "create", "-u", req.username]
+            res1 = await run_cmd(step1_cmd, timeout=60)
+            res1.update({"name": "create_account"})
+            steps.append(res1)
+            logger.info(
+                "step",
+                extra={
+                    "event": "job_step",
+                    "job_id": job.job_id,
+                    "step_name": "create_account",
+                    "command": res1.get("command"),
+                    "exit_code": res1.get("exit_code"),
+                    "stdout": res1.get("stdout"),
+                    "stderr": res1.get("stderr"),
+                },
+            )
+            if res1.get("exit_code") != 0:
+                overall_status = "failed"
+                summary.append("account creation failed")
 
-    asyncio.create_task(runner())
+            # Step 2: Create or take ownership of namespace (attempt newer CLI first)
+            if overall_status == "succeeded":
+                operators = req.operators
+                new_cli_cmd = [
+                    "everestctl",
+                    "namespaces",
+                    "add",
+                    ns,
+                    f"--operator.mongodb={'true' if operators.mongodb else 'false'}",
+                    f"--operator.postgresql={'true' if operators.postgresql else 'false'}",
+                ]
+                if operators.mysql is not None:
+                    new_cli_cmd.append(f"--operator.mysql={'true' if operators.mysql else 'false'}")
+                else:
+                    new_cli_cmd.append("--operator.mysql=false")
+                if req.take_ownership:
+                    new_cli_cmd.append("--take-ownership")
+
+                res2 = await run_cmd(new_cli_cmd, timeout=120)
+                res2.update({"name": "add_namespace"})
+                # Fallback to older flag if unknown option
+                if res2.get("exit_code") != 0 and ("unknown flag" in res2.get("stderr", "").lower() or "unknown flag" in res2.get("stdout", "").lower()):
+                    old_cli_cmd = [
+                        "everestctl",
+                        "namespaces",
+                        "add",
+                        ns,
+                        f"--operator.mongodb={'true' if operators.mongodb else 'false'}",
+                        f"--operator.postgresql={'true' if operators.postgresql else 'false'}",
+                        f"--operator.xtradb-cluster={'true' if operators.xtradb_cluster else 'false'}",
+                    ]
+                    if req.take_ownership:
+                        old_cli_cmd.append("--take-ownership")
+                    res2 = await run_cmd(old_cli_cmd, timeout=120)
+                    res2.update({"name": "add_namespace"})
+
+            steps.append(res2)
+            logger.info(
+                "step",
+                extra={
+                    "event": "job_step",
+                    "job_id": job.job_id,
+                    "step_name": "add_namespace",
+                    "command": res2.get("command"),
+                    "exit_code": res2.get("exit_code"),
+                    "stdout": res2.get("stdout"),
+                    "stderr": res2.get("stderr"),
+                },
+            )
+            if res2.get("exit_code") != 0:
+                overall_status = "failed"
+                summary.append("namespace add failed")
+
+            # Step 3: Apply ResourceQuota & LimitRange
+            if overall_status == "succeeded":
+                manifest = build_quota_limitrange_yaml(ns, req.resources.model_dump())
+                res3 = await run_cmd([
+                    "kubectl",
+                    "apply",
+                    "-n",
+                    ns,
+                    "-f",
+                    "-",
+                ], input_text=manifest, timeout=90)
+                res3.update({
+                    "name": "apply_resource_quota",
+                    "manifest_preview": manifest,
+                })
+                steps.append(res3)
+                logger.info(
+                    "step",
+                    extra={
+                        "event": "job_step",
+                        "job_id": job.job_id,
+                        "step_name": "apply_resource_quota",
+                        "command": res3.get("command"),
+                        "exit_code": res3.get("exit_code"),
+                        "stdout": res3.get("stdout"),
+                        "stderr": res3.get("stderr"),
+                    },
+                )
+                if res3.get("exit_code") != 0:
+                    overall_status = "failed"
+                    summary.append("quota/limits apply failed")
+
+            # Step 4: RBAC policy (if configured)
+            rbac_step = await apply_policy_if_configured(req.username, ns, timeout=90)
+            steps.append(rbac_step)
+            logger.info(
+                "step",
+                extra={
+                    "event": "job_step",
+                    "job_id": job.job_id,
+                    "step_name": "apply_rbac_policy",
+                    "command": rbac_step.get("command"),
+                    "exit_code": rbac_step.get("exit_code"),
+                    "stdout": rbac_step.get("stdout"),
+                    "stderr": rbac_step.get("stderr"),
+                },
+            )
+
+            # Summarize
+            if overall_status == "succeeded" and rbac_step.get("rbac_applied"):
+                summary.append(f"User {req.username} and namespace {ns} created; quota applied; role bound.")
+            elif overall_status == "succeeded":
+                summary.append(f"User {req.username} and namespace {ns} created; quota applied; RBAC skipped.")
+        except Exception as e:
+            overall_status = "failed"
+            steps.append({
+                "name": "internal_error",
+                "command": "<internal>",
+                "exit_code": 1,
+                "stdout": "",
+                "stderr": str(e),
+            })
+            logger.exception("Bootstrap job failed")
+            summary.append("internal error")
+        finally:
+            await jobs.update(
+                job.job_id,
+                status=overall_status,
+                finished_at=utcnow_iso(),
+                summary="; ".join(summary) if summary else overall_status,
+                result={
+                    "inputs": inputs,
+                    "steps": steps,
+                    "overall_status": overall_status,
+                    "summary": "; ".join(summary) if summary else overall_status,
+                },
+            )
+            logger.info(
+                "job finished",
+                extra={
+                    "event": "job_finished",
+                    "job_id": job.job_id,
+                    "status": overall_status,
+                    "summary": "; ".join(summary) if summary else overall_status,
+                },
+            )
+
+    background.add_task(_run)
     return {"job_id": job.job_id, "status_url": f"/jobs/{job.job_id}"}
 
 
 @app.get("/jobs/{job_id}", dependencies=[Depends(require_admin_key)])
-async def get_job_status(job_id: str):
-    job = await job_store.get(job_id)
-    if not job:
+async def job_status(job_id: str):
+    data = await jobs.serialize(job_id)
+    if not data:
         raise HTTPException(status_code=404, detail="job not found")
-    return job.to_status_dict()
+    return data
 
 
 @app.get("/jobs/{job_id}/result", dependencies=[Depends(require_admin_key)])
-async def get_job_result(job_id: str):
-    job = await job_store.get(job_id)
+async def job_result(job_id: str):
+    job = await jobs.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="job not found")
     if job.status not in ("succeeded", "failed"):
-        raise HTTPException(status_code=409, detail="job not completed yet")
-    return job.to_result_dict()
+        raise HTTPException(status_code=409, detail="job not finished")
+    return job.result
 
 
 @app.get("/accounts/list", dependencies=[Depends(require_admin_key)])
 async def accounts_list():
-    # Intentionally using singular per instruction: `everestctl account list`
-    cmd = ["everestctl", "--json", "accounts", "list"]
-    res = await execs.run_cmd_async(cmd)  # type: ignore[arg-type]
-    logger.info(
-        f"request accounts_list exit={res.exit_code} stderr_tail={(res.stderr or '').strip()[-200:]}"
-    )
-    if res.exit_code != 0:
-        # Provide stderr tail
-        detail = res.stderr[-500:] if res.stderr else ""
-        raise HTTPException(status_code=502, detail={"error": "everestctl failed", "detail": detail})
+    # Try JSON first
+    res = await run_cmd(["everestctl", "accounts", "list", "--json"], timeout=30)
+    if res["exit_code"] == 0:
+        try:
+            parsed = parse_accounts_output(res["stdout"])  # json path
+            return parsed
+        except Exception:
+            pass
 
-    parsed = try_parse_json_or_table(res.stdout)
-    return parsed
+    # Fallback without --json
+    res = await run_cmd(["everestctl", "accounts", "list"], timeout=30)
+    if res["exit_code"] == 0:
+        return parse_accounts_output(res["stdout"])  # attempt to parse table
+
+    # Some versions may use singular 'account'
+    res2 = await run_cmd(["everestctl", "account", "list"], timeout=30)
+    if res2["exit_code"] == 0:
+        return parse_accounts_output(res2["stdout"])  # attempt to parse table
+
+    # Failure
+    detail = res.get("stderr") or res2.get("stderr") or "everestctl failed"
+    raise HTTPException(status_code=502, detail={"error": "everestctl failed", "detail": detail[-4000:]})
+
+
+@app.post("/accounts/password", dependencies=[Depends(require_admin_key)])
+async def set_account_password(req: PasswordChangeRequest):
+    """
+    Change a user's password using everestctl. Many versions prompt for the
+    password on stdin; provide it twice (password + confirmation).
+    """
+    # Attempt non-interactive first if supported (unknown; keep stdin flow as primary)
+    input_text = f"{req.new_password}\n{req.new_password}\n"
+    res = await run_cmd([
+        "everestctl",
+        "accounts",
+        "set-password",
+        "-u",
+        req.username,
+    ], timeout=60, input_text=input_text)
+    if res.get("exit_code") != 0:
+        raise HTTPException(status_code=502, detail={"error": "set-password failed", "detail": res.get("stderr", "")[-4000:]})
+    return {"ok": True, "username": req.username}
+
+
+@app.post("/namespaces/resources", dependencies=[Depends(require_admin_key)])
+async def update_namespace_resources(req: NamespaceResourceUpdate):
+    """
+    Apply or update ResourceQuota and LimitRange for a namespace.
+    """
+    manifest = build_quota_limitrange_yaml(req.namespace, req.resources.model_dump())
+    res = await run_cmd([
+        "kubectl",
+        "apply",
+        "-n",
+        req.namespace,
+        "-f",
+        "-",
+    ], input_text=manifest, timeout=90)
+    if res.get("exit_code") != 0:
+        raise HTTPException(status_code=502, detail={"error": "kubectl apply failed", "detail": res.get("stderr", "")[-4000:]})
+    return {"ok": True, "namespace": req.namespace, "applied": True}
+
+
+@app.post("/namespaces/operators", dependencies=[Depends(require_admin_key)])
+async def update_namespace_operators(req: NamespaceOperatorsUpdate):
+    """
+    Enable database operators for a namespace using everestctl. Supports both
+    new (--operator.mysql) and older (--operator.xtradb-cluster) flags.
+    """
+    ops = req.operators
+    new_cli_cmd = [
+        "everestctl",
+        "namespaces",
+        "update",
+        req.namespace,
+        f"--operator.mongodb={'true' if ops.mongodb else 'false'}",
+        f"--operator.postgresql={'true' if ops.postgresql else 'false'}",
+    ]
+    if ops.mysql is not None:
+        new_cli_cmd.append(f"--operator.mysql={'true' if ops.mysql else 'false'}")
+    else:
+        new_cli_cmd.append("--operator.mysql=false")
+    res = await run_cmd(new_cli_cmd, timeout=120)
+
+    # Fallback to older CLI flag if mysql is unknown
+    if res.get("exit_code") != 0 and ("unknown flag" in res.get("stderr", "").lower() or "unknown flag" in res.get("stdout", "").lower()):
+        old_cli_cmd = [
+            "everestctl",
+            "namespaces",
+            "update",
+            req.namespace,
+            f"--operator.mongodb={'true' if ops.mongodb else 'false'}",
+            f"--operator.postgresql={'true' if ops.postgresql else 'false'}",
+            f"--operator.xtradb-cluster={'true' if ops.xtradb_cluster else 'false'}",
+        ]
+        res = await run_cmd(old_cli_cmd, timeout=120)
+
+    if res.get("exit_code") != 0:
+        raise HTTPException(status_code=502, detail={"error": "namespaces update failed", "detail": res.get("stderr", "")[-4000:]})
+    return {"ok": True, "namespace": req.namespace}
+
+
+@app.post("/accounts/suspend", dependencies=[Depends(require_admin_key)])
+async def suspend_user(req: SuspendUserRequest):
+    ns = req.namespace or req.username
+    steps = []
+
+    # Step 1: deactivate/disable/suspend account via everestctl (try variants)
+    deactivate_variants = [
+        ["everestctl", "accounts", "deactivate", "-u", req.username],
+        ["everestctl", "accounts", "disable", "-u", req.username],
+        ["everestctl", "accounts", "suspend", "-u", req.username],
+        ["everestctl", "accounts", "lock", "-u", req.username],
+    ]
+    acct_res = None
+    for variant in deactivate_variants:
+        r = await run_cmd(variant, timeout=60)
+        r.update({"name": "deactivate_account"})
+        steps.append(r)
+        if r.get("exit_code") == 0:
+            acct_res = r
+            break
+    # Step 2: scale down DB workloads
+    scale_res = None
+    if req.scale_statefulsets:
+        scale_cmd = build_scale_statefulsets_cmd(ns)
+        scale_res = await run_cmd(scale_cmd, timeout=90)
+        scale_res.update({"name": "scale_down_statefulsets"})
+        steps.append(scale_res)
+    # Step 3: revoke RBAC
+    rbac_res = None
+    if req.revoke_rbac:
+        rbac_res = await revoke_user_in_rbac_configmap(req.username, timeout=90)
+        steps.append(rbac_res)
+
+    # Consider suspend successful if at least one remediation succeeded
+    scale_ok = (not req.scale_statefulsets) or (scale_res is not None and scale_res.get("exit_code") == 0)
+    rbac_ok = (not req.revoke_rbac) or (rbac_res is not None and rbac_res.get("exit_code") == 0)
+    overall_ok = bool(scale_ok or rbac_ok)
+
+    return {"ok": overall_ok, "username": req.username, "namespace": ns, "steps": steps}
+
+
+@app.post("/accounts/delete", dependencies=[Depends(require_admin_key)])
+async def delete_user(req: DeleteUserRequest):
+    ns = req.namespace or req.username
+    steps = []
+
+    # Step 1: remove namespace (prefer everestctl, fallback to kubectl)
+    rm_ns = await run_cmd(["everestctl", "namespaces", "remove", ns], timeout=180)
+    rm_ns.update({"name": "remove_namespace"})
+    steps.append(rm_ns)
+    if rm_ns.get("exit_code") != 0:
+        # fallback to kubectl delete namespace
+        k8s_del = await run_cmd(["kubectl", "delete", "namespace", ns, "--ignore-not-found=true"], timeout=180)
+        k8s_del.update({"name": "delete_namespace"})
+        steps.append(k8s_del)
+
+    # Step 2: revoke RBAC entries
+    rbac_res = await revoke_user_in_rbac_configmap(req.username, timeout=90)
+    steps.append(rbac_res)
+
+    # Step 3: delete account (try delete/remove)
+    del_cmds = [
+        ["everestctl", "accounts", "delete", "-u", req.username],
+        ["everestctl", "accounts", "remove", "-u", req.username],
+    ]
+    acct_del_res = None
+    for cmd in del_cmds:
+        r = await run_cmd(cmd, timeout=60)
+        r.update({"name": "delete_account"})
+        steps.append(r)
+        if r.get("exit_code") == 0:
+            acct_del_res = r
+            break
+
+    overall_ok = True
+    # Consider operation ok if namespace removal via either method succeeded and account deletion succeeded
+    ns_ok = any(s.get("name") in ("remove_namespace", "delete_namespace") and s.get("exit_code") == 0 for s in steps)
+    acct_ok = acct_del_res is not None and acct_del_res.get("exit_code") == 0
+    if not ns_ok or not acct_ok:
+        overall_ok = False
+
+    return {"ok": overall_ok, "username": req.username, "namespace": ns, "steps": steps}

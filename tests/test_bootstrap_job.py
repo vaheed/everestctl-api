@@ -1,55 +1,47 @@
-import os
-import time
-from fastapi.testclient import TestClient
 import asyncio
+import pytest
+import httpx
 
 from app.app import app
-from app import execs
 
 
-def test_bootstrap_job_flow(monkeypatch):
-    client = TestClient(app)
-    admin_key = os.getenv("ADMIN_API_KEY", "changeme")
+@pytest.mark.asyncio
+async def test_bootstrap_job_success(monkeypatch):
+    async def fake_run_cmd(cmd, **kwargs):
+        # Simulate success for all
+        stdout = "ok"
+        # Simulate unknown flag fallback for namespaces add with mysql
+        if cmd[:3] == ["everestctl", "namespaces", "add"] and any("--operator.mysql" in c for c in cmd):
+            return {"exit_code": 1, "stdout": "", "stderr": "unknown flag: --operator.mysql", "command": " ".join(cmd)}
+        if cmd[:3] == ["everestctl", "namespaces", "add"] and any("--operator.xtradb-cluster" in c for c in cmd):
+            return {"exit_code": 0, "stdout": stdout, "stderr": "", "command": " ".join(cmd)}
+        return {"exit_code": 0, "stdout": stdout, "stderr": "", "command": " ".join(cmd)}
 
-    def fake_run_cmd(_cmd, input_text=None, timeout=60, env=None):
-        # succeed for any command
-        return execs.CmdResult(0, "ok", "", 0.0, 0.0)
+    from app import app as app_module
+    monkeypatch.setattr(app_module, "run_cmd", fake_run_cmd)
 
-    monkeypatch.setattr(execs, "run_cmd", fake_run_cmd)
+    headers = {"X-Admin-Key": "changeme"}
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as ac:
+        r = await ac.post("/bootstrap/users", json={"username": "alice"}, headers=headers)
+        assert r.status_code == 202
+        job_id = r.json()["job_id"]
 
-    async def fake_run_cmd_async(cmd, input_text=None, timeout=60, env=None):
-        return fake_run_cmd(cmd, input_text, timeout, env)
+        # Poll for completion
+        for _ in range(20):
+            s = await ac.get(f"/jobs/{job_id}", headers=headers)
+            assert s.status_code == 200
+            if s.json()["status"] in ("succeeded", "failed"):
+                break
+            await asyncio.sleep(0.05)
 
-    def fake_run_cmd_tty(cmd, input_text=None, timeout=60, env=None):
-        return fake_run_cmd(cmd, input_text, timeout, env)
-
-    async def fake_run_cmd_tty_async(cmd, input_text=None, timeout=60, env=None):
-        return fake_run_cmd(cmd, input_text, timeout, env)
-
-    monkeypatch.setattr(execs, "run_cmd_async", fake_run_cmd_async)
-    monkeypatch.setattr(execs, "run_cmd_tty", fake_run_cmd_tty)
-    monkeypatch.setattr(execs, "run_cmd_tty_async", fake_run_cmd_tty_async)
-
-    r = client.post(
-        "/bootstrap/users",
-        headers={"X-Admin-Key": admin_key, "Content-Type": "application/json"},
-        json={"username": "alice"},
-    )
-    assert r.status_code == 202
-    body = r.json()
-    job_id = body["job_id"]
-
-    # poll for completion
-    for _ in range(50):
-        sr = client.get(f"/jobs/{job_id}", headers={"X-Admin-Key": admin_key})
-        assert sr.status_code == 200
-        status = sr.json()["status"]
-        if status in ("succeeded", "failed"):
-            break
-        time.sleep(0.02)
-
-    rr = client.get(f"/jobs/{job_id}/result", headers={"X-Admin-Key": admin_key})
-    assert rr.status_code == 200
-    result = rr.json()
-    assert result["overall_status"] in ("succeeded", "failed")
-    assert isinstance(result.get("steps"), list)
+        res = await ac.get(f"/jobs/{job_id}/result", headers=headers)
+        assert res.status_code == 200
+        body = res.json()
+        assert body["overall_status"] in ("succeeded",)
+        # verify step names
+        step_names = [s.get("name") for s in body.get("steps", [])]
+        assert "create_account" in step_names
+        assert "add_namespace" in step_names
+        assert "apply_resource_quota" in step_names
+        assert "apply_rbac_policy" in step_names
