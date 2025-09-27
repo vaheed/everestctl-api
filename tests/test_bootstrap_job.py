@@ -1,3 +1,4 @@
+import os
 import time
 from fastapi.testclient import TestClient
 
@@ -16,7 +17,7 @@ def test_bootstrap_job_flow(monkeypatch):
 
     r = client.post(
         "/bootstrap/users",
-        headers={"X-Admin-Key": "changeme", "Content-Type": "application/json"},
+        headers={"X-Admin-Key": os.getenv("ADMIN_API_KEY", "changeme"), "Content-Type": "application/json"},
         json={"username": "alice"},
     )
     assert r.status_code == 202
@@ -37,4 +38,3 @@ def test_bootstrap_job_flow(monkeypatch):
     result = rr.json()
     assert result["overall_status"] in ("succeeded", "failed")
     assert isinstance(result.get("steps"), list)
-
