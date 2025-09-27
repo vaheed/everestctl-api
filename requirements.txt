@@ -2,5 +2,6 @@ fastapi>=0.110,<1.0
 uvicorn[standard]>=0.24,<1.0
 pydantic>=2.3,<3.0
 pytest>=7,<9
+pytest-asyncio>=0.21,<1.0
 httpx>=0.24,<1.0
 uvloop>=0.17,<1.0; platform_system == 'Linux'
