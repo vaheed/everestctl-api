@@ -1,0 +1,19 @@
+services:
+  everestctl-api:
+    build:
+      context: .
+    env_file:
+      - .env
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/data
+      # Optional: provide local everestctl binary inside the container
+      # - ./everestctl:/usr/local/bin/everestctl:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request as u; print(u.urlopen('http://localhost:8080/healthz').read())\" >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
