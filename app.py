@@ -51,12 +51,19 @@ app.add_middleware(RequestContextMiddleware)
 db = Database(SQLITE_DB)
 
 
-# Metrics
-http_requests_total = Counter("http_requests_total", "HTTP requests", ["method", "path", "status"])
-http_latency_seconds = Histogram("http_latency_seconds", "HTTP request latency", ["method", "path"])  # type: ignore[assignment]
-cli_invocations_total = Counter("cli_invocations_total", "CLI invocations", ["cmd", "exit_code"])  # used via logging if desired
-quota_violations_total = Counter("quota_violations_total", "Quota violations", ["type"])  # type: ignore[assignment]
-rate_limit_block_total = Counter("rate_limit_block_total", "Rate limit blocks")
+# Metrics (register only when enabled to avoid duplicate registration on reload during tests)
+if METRICS_ENABLED:
+    http_requests_total = Counter("http_requests_total", "HTTP requests", ["method", "path", "status"])
+    http_latency_seconds = Histogram("http_latency_seconds", "HTTP request latency", ["method", "path"])  # type: ignore[assignment]
+    cli_invocations_total = Counter("cli_invocations_total", "CLI invocations", ["cmd", "exit_code"])  # used via logging if desired
+    quota_violations_total = Counter("quota_violations_total", "Quota violations", ["type"])  # type: ignore[assignment]
+    rate_limit_block_total = Counter("rate_limit_block_total", "Rate limit blocks")
+else:
+    http_requests_total = None
+    http_latency_seconds = None
+    cli_invocations_total = None
+    quota_violations_total = None
+    rate_limit_block_total = None
 
 
 def metrics_enabled():

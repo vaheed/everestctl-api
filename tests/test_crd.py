@@ -13,6 +13,7 @@ def test_tenant_policy_yaml():
         },
         ["postgresql", "mysql"],
     )
-    assert "TenantResourcePolicy" not in y  # that's in CRD, not the instance
-    assert "ns-a" in y and "cpuCores: 4.0" in y
-
+    assert "apiVersion: everest.local/v1" in y
+    assert "kind: TenantResourcePolicy" in y
+    assert "namespace: ns-a" in y
+    assert "cpuCores: 4.0" in y

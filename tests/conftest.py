@@ -24,7 +24,9 @@ def _env(monkeypatch):
 @pytest.fixture(autouse=True)
 def stub_cli(monkeypatch):
     def fake_run(argv, timeout=None, retries=None, stdin_input=None):
-        cmd = " ".join(argv)
+        # Emulate allowlist behavior: raise on disallowed argv
+        if not cli_module._is_allowed(argv):  # type: ignore[attr-defined]
+            raise ValueError("command not allow-listed: %s" % (argv,))
         if argv[:3] == ["everestctl", "accounts", "list"]:
             return 0, "alice\n", ""
         if argv[:3] == ["everestctl", "namespaces", "list"]:
