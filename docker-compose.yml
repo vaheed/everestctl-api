@@ -4,9 +4,7 @@ services:
       context: .
     env_file:
       - .env
-    environment:
-      # Ensure everestctl uses the provided kubeconfig
-      KUBECONFIG: /data/kubeconfig
+    # No need to set KUBECONFIG explicitly; entrypoint auto-detects mounted kubeconfig
     ports:
       - "8080:8080"
     volumes:

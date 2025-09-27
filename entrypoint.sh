@@ -13,9 +13,17 @@ else
   if [ ! -x "$EVERESTCTL_PATH" ] && ! command -v "$EVERESTCTL_PATH" >/dev/null 2>&1; then
     echo "ERROR: everestctl not found at $EVERESTCTL_PATH"; exit 1
   fi
-  # Kubeconfig must be provided for CLI operations
+  # Ensure kubeconfig is available. Auto-detect common locations if not provided via env.
   if [ -z "${KUBECONFIG:-}" ]; then
-    echo "ERROR: KUBECONFIG is not set; mount your kubeconfig and set KUBECONFIG"; exit 1
+    if [ -r "/data/kubeconfig" ]; then
+      export KUBECONFIG="/data/kubeconfig"
+      echo "INFO: using kubeconfig at $KUBECONFIG"
+    elif [ -r "$HOME/.kube/config" ]; then
+      export KUBECONFIG="$HOME/.kube/config"
+      echo "INFO: using kubeconfig at $KUBECONFIG"
+    else
+      echo "ERROR: kubeconfig not found. Mount your kubeconfig or set KUBECONFIG"; exit 1
+    fi
   fi
   if [ ! -r "$KUBECONFIG" ]; then
     echo "ERROR: kubeconfig not found or not readable at $KUBECONFIG"; exit 1
