@@ -69,7 +69,8 @@ USER app
 ENV EVERESTCTL_PATH=/usr/local/bin/everestctl \
     RBAC_POLICY_PATH=/data/policy.csv \
     DB_PATH=/data/audit.db \
-    METRICS_ENABLED=true
+    METRICS_ENABLED=true \
+    KUBECONFIG=/data/kubeconfig
 
 EXPOSE 8080
 ENTRYPOINT ["/usr/bin/tini","-g","--"]
