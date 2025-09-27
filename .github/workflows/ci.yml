@@ -22,6 +22,7 @@ jobs:
         env:
           API_KEY: test
           SKIP_CLI_CHECK: '1'
+          PYTHONPATH: .
         run: pytest -q
       - name: Build Docker image
         uses: docker/build-push-action@v6
@@ -29,4 +30,3 @@ jobs:
           context: .
           load: true
           tags: everestctl-api:test
-
