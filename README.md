@@ -1,118 +1,99 @@
-# everestctl-api
+# Everestctl Async API (FastAPI)
 
-Minimal FastAPI service exposing `everestctl account list` over HTTP with auth, containerization, tests, and CI.
+Production-ready, minimal async API to bootstrap users and namespaces in a Percona Everest cluster using `everestctl` and `kubectl`. Implements an async job pattern with polling and structured results.
 
-## Overview
-
-- Endpoint: `GET /accounts/list`
-- Auth: requires header `X-Admin-Key: <ADMIN_API_KEY>`
-- On success: runs `everestctl account list`, parses stdout (JSON pass-through or robust text-table parsing), and returns:
-  `{ "data": <parsed_result>, "source": "everestctl account list" }`
-- On auth failure: `401 {"error":"unauthorized"}`
-- On CLI failure: `502 {"error":"everestctl failed", "detail":"..."}`
-- On missing everestctl: `500 {"error":"everestctl not found", ...}`
-
-The service binds to `0.0.0.0` and uses `PORT` env var (default 8080).
+- Async FastAPI + in-memory job store (documented upgrade path)
+- Endpoints secured by `X-Admin-Key`
+- Docker image installs `kubectl` and `everestctl`
+- docker-compose mounts host kubeconfig
+- GitHub Actions: test → build/push
 
 ## Quickstart
 
-Prerequisites:
+```bash
+docker-compose up --build -d
+export BASE_URL="http://localhost:8080"
+export ADMIN_API_KEY="changeme"
+```
 
-- Docker and docker-compose
-- A valid kubeconfig on the host at `~/.kube/config`
+## Submit a bootstrap job
+```bash
+curl -sS -X POST "$BASE_URL/bootstrap/users" \
+  -H "X-Admin-Key: $ADMIN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{ "username": "alice" }'
+# => { "job_id": "...", "status_url": "/jobs/..." }
+```
 
-Steps:
+## Check job
+```bash
+curl -sS "$BASE_URL/jobs/<JOB_ID>" -H "X-Admin-Key: $ADMIN_API_KEY"
+```
 
-1. Build and start
+## Get result
+```bash
+curl -sS "$BASE_URL/jobs/<JOB_ID>/result" -H "X-Admin-Key: $ADMIN_API_KEY"
+```
 
-   - `docker-compose up --build`
+## List accounts
+```bash
+curl -sS -X GET "$BASE_URL/accounts/list" -H "X-Admin-Key: $ADMIN_API_KEY"
+```
 
-2. Usage
+Notes
+- Works async: submit → poll → fetch result.
+- Container expects kubeconfig mounted at `/root/.kube/config`.
 
-   - Export variables and call the API:
+## Endpoints
 
-     ```sh
-     export BASE_URL="http://localhost:8080"
-     export ADMIN_API_KEY="changeme"
-     curl -sS -X GET "$BASE_URL/accounts/list" -H "X-Admin-Key: $ADMIN_API_KEY"
-     ```
+- POST `/bootstrap/users` → 202 with `{ job_id, status_url }`
+- GET `/jobs/{job_id}` → job status
+- GET `/jobs/{job_id}/result` → final structured result
+- GET `/accounts/list` → pass-through to `everestctl account list`, returns JSON or parsed table
+- GET `/healthz`, `/readyz` → basic probes
+
+Auth: all protected endpoints require header `X-Admin-Key: <ADMIN_API_KEY>`.
 
 ## Configuration
 
-- `ADMIN_API_KEY` is required for authorization and is validated against the `X-Admin-Key` header.
-- `PORT` (default `8080`) controls the bind port.
-- `KUBECONFIG` is expected to be `/root/.kube/config` inside the container; compose mounts the host kubeconfig there.
+- `ADMIN_API_KEY`: shared header token for admin actions
+- `SUBPROCESS_TIMEOUT` (default 60): per-command timeout seconds
+- `MAX_OUTPUT_CHARS` (default 20000): truncate large outputs
+- `EVEREST_RBAC_APPLY_CMD`: if set, apply Casbin-like policy using this command. Supports `{file}` placeholder or appends `--file <path>`.
 
-## Notes on everestctl
+## Implementation Highlights
 
-- The Dockerfile installs `kubectl` and attempts to install `everestctl`.
-- Update the `EVERESTCTL_URL` in the Dockerfile to the correct Linux amd64 release URL if `everestctl` is a downloadable binary.
-- If `everestctl` is a Python package, the Dockerfile includes a fallback `pip install everestctl` step (commented behavior explained inline) — adjust as needed.
-- The container relies on a mounted kubeconfig at `/root/.kube/config` to operate with `kubectl`/`everestctl` using `KUBECONFIG` set.
+- In-memory job queue with asyncio tasks. For production, switch to Redis/RQ, Celery, or DB queue with persistence and retries.
+- Structured logging to stdout with request id and timing via middleware.
+- ResourceQuota and LimitRange YAMLs generated from inputs and applied via `kubectl apply -f -`.
+- Error handling maps CLI failures to 502 on pass-through and marks jobs failed with clear summaries.
 
-## Project Layout
+## Docker
 
-```
-.
-├── app/
-│   ├── app.py                 # FastAPI app + route
-│   ├── __init__.py
-│   ├── dependencies.py        # auth helpers, subprocess wrappers
-│   └── parsers.py             # parse everestctl output (JSON or text)
-├── tests/
-│   └── test_app.py            # pytest with subprocess mocking
-├── requirements.txt
-├── Dockerfile
-├── docker-compose.yml
-├── .dockerignore
-├── .gitignore
-├── .github/
-│   └── workflows/
-│       └── ci.yml             # test + deploy stages on push
-└── README.md
+Build and run locally:
+```bash
+docker build -t everestctl-api .
+docker run --rm -p 8080:8080 -e ADMIN_API_KEY=changeme \
+  -v $HOME/.kube/config:/root/.kube/config:ro everestctl-api
 ```
 
-## Development & Testing
+## CI
 
-Local tests:
+- GitHub Actions runs tests, then builds and optionally pushes an image if registry secrets exist.
 
-```sh
-python -m venv .venv && . .venv/bin/activate
-pip install -r requirements.txt
-pytest -q
-```
+## Development
 
-The tests mock `subprocess.run` to simulate `everestctl` output in JSON and tabular forms, and error scenarios.
+- Install deps: `pip install -r requirements.txt`
+- Run API: `uvicorn app.app:app --host 0.0.0.0 --port 8080`
+- Run tests: `pytest -q`
 
-## CI/CD
+## Security Notes
 
-GitHub Actions workflow has two stages:
+- Header auth enforced for all mutating and protected routes.
+- Do not log secrets; logs contain minimal request metadata and a correlation id.
+- Container runs as non-root (UID 10001) but may require root if CLIs demand it; adjust Dockerfile accordingly.
 
-1. test
-   - Checks out code, sets up Python 3.11, caches pip, installs requirements, runs `pytest -q`.
-2. deploy (needs: test)
-   - Builds a Docker image tagged with `${{ github.sha }}`.
-   - Pushes the image to a registry if the following secrets are present: `REGISTRY`, `REGISTRY_USERNAME`, `REGISTRY_PASSWORD`, `IMAGE_NAME`.
-   - Includes a placeholder `kubectl apply` step that runs only if `KUBECONFIG_B64` and other registry secrets are present. Replace with your deployment commands.
+## References
 
-Required secrets for deploy:
-
-- `REGISTRY` (e.g., `ghcr.io/owner/repo` or `registry.hub.docker.com`)
-- `REGISTRY_USERNAME`
-- `REGISTRY_PASSWORD`
-- `IMAGE_NAME` (e.g., `everestctl-api`)
-
-Adjust registry/name as needed in `.github/workflows/ci.yml`.
-
-## Troubleshooting
-
-- 401 unauthorized: Ensure you send `X-Admin-Key` and it matches `ADMIN_API_KEY`.
-- 500 everestctl not found: Validate that `everestctl` is installed in the container and on `PATH`. The Dockerfile includes installation steps — verify the URL or package installation.
-- 502 everestctl failed: Inspect the `detail` field for stderr from the command; ensure `KUBECONFIG` is valid and the process has necessary cluster access.
-- Missing kubeconfig: Ensure your host `~/.kube/config` exists; docker-compose mounts it read-only to `/root/.kube/config`.
-
-## Security
-
-- The service never logs `ADMIN_API_KEY`.
-- Authorization enforced per request via `X-Admin-Key`.
+- Percona Everest docs: https://docs.percona.com/everest/
 

@@ -1,66 +1,124 @@
+from __future__ import annotations
+
+import asyncio
+import logging
 import os
-import subprocess
-from fastapi import FastAPI, Header
+import time
+import uuid
+from typing import Any, Dict, Optional
+
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 
-from .dependencies import (
-    everestctl_available,
-    get_admin_api_key,
-    run_everestctl_account_list,
-    validate_admin_key,
-)
-from .parsers import parse_everestctl_output
+from .execs import run_cmd
+from .jobs import job_store, run_bootstrap_job
+from .parsers import try_parse_json_or_table
 
 
-app = FastAPI(title="everestctl-api", version="1.0.0")
-
-# Evaluate availability at startup; tests can monkeypatch this.
-EVERESTCTL_AVAILABLE = everestctl_available()
+ADMIN_API_KEY = os.environ.get("ADMIN_API_KEY", "changeme")
 
 
-@app.get("/accounts/list")
-def accounts_list(x_admin_key: str | None = Header(default=None, alias="X-Admin-Key")):
-    expected_key = get_admin_api_key()
-
-    if not validate_admin_key(x_admin_key, expected_key):
-        return JSONResponse(status_code=401, content={"error": "unauthorized"})
-
-    if not EVERESTCTL_AVAILABLE:
-        return JSONResponse(
-            status_code=500,
-            content={
-                "error": "everestctl not found",
-                "detail": "The 'everestctl' binary is not available on PATH. Ensure it is installed in the container and PATH is set.",
-            },
+def get_logger() -> logging.Logger:
+    logger = logging.getLogger("everestctl_api")
+    if not logger.handlers:
+        handler = logging.StreamHandler()
+        formatter = logging.Formatter(
+            fmt='{"ts": %(asctime)s, "level": "%(levelname)s", "msg": "%(message)s", "logger": "%(name)s"}',
+            datefmt="%Y-%m-%dT%H:%M:%S%z",
         )
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+        logger.setLevel(logging.INFO)
+    return logger
 
+
+logger = get_logger()
+
+app = FastAPI(title="Everestctl Async API", version="1.0.0")
+
+
+@app.middleware("http")
+async def add_request_id(request: Request, call_next):
+    req_id = request.headers.get("X-Request-ID", str(uuid.uuid4()))
+    request.state.request_id = req_id
+    start = time.time()
     try:
-        cp: subprocess.CompletedProcess = run_everestctl_account_list()
-    except subprocess.CalledProcessError as e:
-        return JSONResponse(
-            status_code=502,
-            content={
-                "error": "everestctl failed",
-                "detail": e.stderr or str(e),
-            },
+        response: Response = await call_next(request)
+    finally:
+        dur = time.time() - start
+        logger.info(
+            f"request {request.method} {request.url.path} id={req_id} dur={dur:.3f}s",
         )
-    except subprocess.TimeoutExpired as e:
-        return JSONResponse(
-            status_code=502,
-            content={
-                "error": "everestctl timeout",
-                "detail": str(e),
-            },
-        )
-
-    parsed = parse_everestctl_output(cp.stdout)
-    return {"data": parsed, "source": "everestctl account list"}
+    response.headers["X-Request-ID"] = req_id
+    return response
 
 
-def get_port() -> int:
-    raw = os.getenv("PORT", "8080")
-    try:
-        return int(raw)
-    except ValueError:
-        return 8080
+async def require_admin_key(x_admin_key: Optional[str] = Header(None, alias="X-Admin-Key")):
+    if not x_admin_key or x_admin_key != ADMIN_API_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized: missing or invalid X-Admin-Key")
+
+
+@app.get("/healthz")
+async def healthz():
+    return {"status": "ok"}
+
+
+@app.get("/readyz")
+async def readyz():
+    # Could add additional checks here
+    return {"status": "ready"}
+
+
+@app.post("/bootstrap/users", status_code=202, dependencies=[Depends(require_admin_key)])
+async def submit_bootstrap_job(payload: Dict[str, Any]):
+    username = payload.get("username")
+    if not username or not str(username).strip():
+        raise HTTPException(status_code=422, detail="username is required")
+
+    inputs = {
+        "username": str(username).strip(),
+        "namespace": (payload.get("namespace") or str(username).strip()),
+        "operators": payload.get("operators") or {},
+        "take_ownership": bool(payload.get("take_ownership", False)),
+        "resources": payload.get("resources") or {},
+    }
+
+    job = await job_store.create_job(inputs)
+
+    async def runner():
+        await run_bootstrap_job(job)
+
+    asyncio.create_task(runner())
+    return {"job_id": job.job_id, "status_url": f"/jobs/{job.job_id}"}
+
+
+@app.get("/jobs/{job_id}", dependencies=[Depends(require_admin_key)])
+async def get_job_status(job_id: str):
+    job = await job_store.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="job not found")
+    return job.to_status_dict()
+
+
+@app.get("/jobs/{job_id}/result", dependencies=[Depends(require_admin_key)])
+async def get_job_result(job_id: str):
+    job = await job_store.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="job not found")
+    if job.status not in ("succeeded", "failed"):
+        raise HTTPException(status_code=409, detail="job not completed yet")
+    return job.to_result_dict()
+
+
+@app.get("/accounts/list", dependencies=[Depends(require_admin_key)])
+async def accounts_list():
+    # Intentionally using singular per instruction: `everestctl account list`
+    res = run_cmd(["everestctl", "account", "list"])  # type: ignore[arg-type]
+    if res.exit_code != 0:
+        # Provide stderr tail
+        detail = res.stderr[-500:] if res.stderr else ""
+        raise HTTPException(status_code=502, detail={"error": "everestctl failed", "detail": detail})
+
+    parsed = try_parse_json_or_table(res.stdout)
+    return parsed
 

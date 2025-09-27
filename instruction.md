@@ -1,384 +1,364 @@
-# 🔧 - Production‑grade **Everest Tenant Bootstrap Proxy** (FastAPI + `everestctl`)
+# Prompt: Production-Ready Async API to Bootstrap Users in Percona Everest (FastAPI + Jobs + Docker + CI)
 
-> **Goal:** Design & generate a hardened HTTP API that wraps **`everestctl`** for tenant lifecycle (users, namespaces, RBAC) and per‑namespace resource policies (CPU, memory, max DB users) using **Kubernetes CRDs** — with strict security, stability, observability, tests, and deploy artifacts.
+Create a **production-ready**, minimal repository that implements an **async, job-based REST API** which bootstraps users and namespaces in a Percona **Everest** cluster using `everestctl` and `kubectl`.
 
-**Authoritative docs to follow for CLI parity:**  
-- Users: https://docs.percona.com/everest/administer/manage_users.html  
-- Namespaces: https://docs.percona.com/everest/administer/manage_namespaces.html  
-- RBAC (policy.csv / everest-rbac ConfigMap / validate & can): https://docs.percona.com/everest/administer/rbac.html
+**Reference docs:** https://docs.percona.com/everest/
 
 ---
 
-## 0) Ground rules (must follow exactly)
+## Goals
 
-- **Only** call `everestctl` with **validated, allow‑listed argv** (never use a shell).
-- Match **current Percona Everest CLI** for **user** and **namespace** commands and **RBAC** behavior per the docs above.
-- RBAC is stored in ConfigMap **`everest-rbac`** (namespace `everest-system`), with `data.enabled: "true"` and `data.policy.csv` content.
-- Implement **per‑tenant CRD** (Kubernetes CustomResourceDefinition) for resource policy (CPU/memory/user limits) and **bind** it to the tenant’s namespace; the proxy enforces these limits before cluster creation and maintains usage counters.
-
-> ✅ Commands that MUST exist & be wired as API endpoints (verify at startup with `everestctl help` and fail fast if missing):
->
-> - `everestctl accounts create -u <username>`
-> - `everestctl accounts set-password -u <username>`
-> - `everestctl accounts list`
-> - `everestctl accounts delete -u <username>`
-> - `everestctl namespaces add <NAMESPACE> [--operator.mongodb=<bool>] [--operator.postgresql=<bool>] [--operator.xtradb-cluster=<bool>] [--take-ownership]`
-> - `everestctl namespaces update <NAMESPACE>`  *(adding operators; removing not supported)*
-> - `everestctl namespaces remove <NAMESPACE> [--keep-namespace]`
-> - `everestctl settings rbac validate [--policy-file <path>]`
-> - `everestctl settings rbac can [--policy-file <path>]`
+- Async HTTP API (FastAPI) with a **job queue** pattern:
+  - Client submits work → receives **job id**
+  - Client can **poll job status**
+  - When finished, client can **retrieve job result**
+- Bootstrapping workflow leverages **everestctl** and **kubectl**:
+  - Create Everest account
+  - Create/own namespace with operator flags
+  - Apply ResourceQuota & LimitRange based on provided or default resources
+  - Apply a Casbin-like RBAC policy mapping a role to the user
+- Fully containerized:
+  - Dockerfile installs **kubectl** and **everestctl**
+  - docker-compose mounts host **KUBECONFIG**
+- CI/CD via GitHub Actions:
+  - **test → deploy** stages on push
+- Endpoint auth via header: **`X-Admin-Key: <ADMIN_API_KEY>`**
+- Include all list and deatils (like `everestctl account list`), plus **README**.
 
 ---
 
-## 1) Deliverables (repository layout)
+## Tech & Tooling
 
-Create a complete repo with **working code**, **tests**, and **deploy** artifacts:
+- **Python 3.11+**
+- **FastAPI** (async) + **Uvicorn**
+- **pytest**, **httpx** (tests)
+- **Dockerfile** (installs `kubectl` & `everestctl`)
+- **docker-compose** (mount host kubeconfig; pass env)
+- **GitHub Actions**: two-stage **test** → **deploy** on `push`
+- In-container: `KUBECONFIG` exported so `kubectl` & `everestctl` work
+
+---
+
+## API (Async Job Pattern)
+
+All endpoints are **async**. Long-running work executes in a background task and is tracked by a **job id**.
+
+### 1) Submit Bootstrap Job
+`POST /bootstrap/users`
+
+**Request JSON** (all fields optional except `username`):
+```json
+{
+  "username": "alice",
+  "namespace": "alice-ns",
+  "operators": {
+    "mongodb": true,
+    "postgresql": true,
+    "xtradb_cluster": false
+  },
+  "take_ownership": false,
+  "resources": {
+    "cpu_cores": 8,
+    "ram_mb": 4096,
+    "disk_gb": 100
+  }
+}
+```
+
+**Defaults** when omitted:
+- `namespace`: `<username>`
+- `operators`: all `false`
+- `take_ownership`: `false`
+- `resources`: `cpu_cores=2`, `ram_mb=2048`, `disk_gb=20`
+
+**Response (202)**:
+```json
+{ "job_id": "<uuid>", "status_url": "/jobs/<uuid>" }
+```
+
+### 2) Check Job Status
+`GET /jobs/{job_id}`
+
+**Response**:
+```json
+{
+  "job_id": "...",
+  "status": "queued|running|succeeded|failed",
+  "started_at": "...",
+  "finished_at": null,
+  "summary": "short human summary",
+  "result_url": "/jobs/<uuid>/result"
+}
+```
+
+### 3) Fetch Job Result
+`GET /jobs/{job_id}/result` → returns full structured output **after completion**.
+
+### 4) List Accounts (Pass-through)
+`GET /accounts/list` with header `X-Admin-Key: <ADMIN_API_KEY>`.  
+Runs:
+```
+everestctl account list
+```
+- If stdout is JSON → return `{"data": <json>}`
+- If stdout is tabular/text → parse to structured JSON (pipe/whitespace split)
+- On non-zero exit → **502** with `{ "error": "everestctl failed", "detail": "<stderr tail>" }`
+
+**Auth**: All protected endpoints require `X-Admin-Key`; otherwise **401**.
+
+---
+
+## Bootstrap Workflow (Steps the Job Performs)
+
+1) **Create Everest account**
+   ```
+   everestctl accounts create -u <username>
+   ```
+
+2) **Create (or take ownership of) namespace**
+   ```
+   everestctl namespaces add <namespace> \
+     --operator.mongodb=<true|false> \
+     --operator.postgresql=<true|false> \
+     --operator.xtradb-cluster=<true|false> \
+     [--take-ownership]
+   ```
+
+3) **Apply ResourceQuota & LimitRange** (via `kubectl apply -f -`):
+   - Quota values come from `resources`:
+     - CPU: `<cpu_cores>`
+     - Memory: `<ram_mb>Mi`
+     - Storage: `<disk_gb>Gi`
+   - Include a **LimitRange** with sane defaults/requests (e.g., 25–50% of quota).
+
+   **ResourceQuota (example)**
+   ```yaml
+   apiVersion: v1
+   kind: ResourceQuota
+   metadata:
+     name: user-quota
+   spec:
+     hard:
+       requests.cpu: "<cpu_cores>"
+       requests.memory: "<ram_mb>Mi"
+       requests.storage: "<disk_gb>Gi"
+       limits.cpu: "<cpu_cores>"
+       limits.memory: "<ram_mb>Mi"
+   ```
+
+4) **Apply RBAC Policy (Casbin-like)**:
+   - Create a temp `policy.csv` with lines templated to the user’s namespace:
+     ```
+     p, role:alice, namespaces, read, <namespace>
+     p, role:alice, database-engines, read, <namespace>/*
+     p, role:alice, database-clusters, read, <namespace>/*
+     p, role:alice, database-clusters, update, <namespace>/*
+     p, role:alice, database-clusters, create, <namespace>/*
+     p, role:alice, database-clusters, delete, <namespace>/*
+     p, role:alice, database-cluster-credentials, read, <namespace>/*
+     g, <username>, role:alice
+     ```
+   - Apply with a configurable command (env: `EVEREST_RBAC_APPLY_CMD`), e.g.:
+     ```
+     everestctl access-control import --file <policy.csv>
+     ```
+   - If not configured, **skip with warning** and set `rbac_applied=false` in the job result.
+
+**Result Shape** returned by `/jobs/{id}/result`:
+```json
+{
+  "inputs": { ...resolved defaults... },
+  "steps": [
+    { "name": "create_account", "command": "...", "exit_code": 0, "stdout": "...", "stderr": "" },
+    { "name": "add_namespace", "command": "...", "exit_code": 0, "stdout": "...", "stderr": "" },
+    { "name": "apply_resource_quota", "command": "kubectl apply -n <ns> -f -", "manifest_preview": "...", "exit_code": 0 },
+    { "name": "apply_rbac_policy", "command": "<resolved cmd>", "exit_code": 0, "rbac_applied": true }
+  ],
+  "overall_status": "succeeded|failed",
+  "summary": "User <u> and namespace <ns> created; quota applied; role bound."
+}
+```
+
+---
+
+## Security, Reliability, and Production Readiness
+
+- **Auth**: `X-Admin-Key` per request; never log secrets.
+- **Timeouts**: Set subprocess timeouts (e.g., 60s); return structured errors.
+- **Graceful shutdown**: Handle SIGTERM/SIGINT (Uvicorn) to finish/abort jobs cleanly.
+- **Health endpoints**: `/healthz` (liveness) & `/readyz` (readiness) returning minimal JSON.
+- **Observability**: Structured JSON logging; include job id in logs; basic request logging with correlation id.
+- **Validation**: Pydantic models; strict types; defaulting and coercion for `resources`.
+- **Error handling**: Map known failure modes (`everestctl` missing, kubeconfig missing, non-zero exit) to 4xx/5xx with clear JSON.
+- **In-memory job store (demo)**: Document that production should use Redis/RQ/Celery or a DB-backed queue and persistent job logs.
+- **Least privilege**: Container runs as non-root where feasible (except where CLIs require root); read-only mounts for kubeconfig.
+- **Rate limiting / auth hardening**: Optional, documented; ensure header auth is enforced for all mutating routes.
+
+---
+
+## Project Layout
 
 ```
 .
-├── app.py                   # FastAPI app (routers, DI, OpenAPI tags)
-├── cli.py                   # Safe everestctl runner (argv allowlist, timeouts, retries)
-├── rbac.py                  # RBAC file ops (atomic policy.csv, validate/apply)
-├── quotas.py                # Quota CRUD, enforcement, usage counters
-├── crd.py                   # K8s CRD manifests + controller shim (via kubernetes client or kubectl)
-├── db.py                    # SQLite (default) or Postgres, migrations, audit writer
-├── auth.py                  # API key auth (constant-time), rate limiting, idempotency keys
-├── logging_setup.py         # JSON logs + request_id middleware
-├── schemas.py               # Pydantic v2 models, strict validation
-├── kubernetes/
-│   ├── crd-tenantresourcepolicy.yaml   # CRD definition (v1)
-│   └── rbac-reader-role.yaml           # Optional read-only role for operators
-├── gunicorn_conf.py         # JSON access logs, sane worker defaults
-├── entrypoint.sh            # Preflight checks; tini; fail fast on misconfig
-├── Dockerfile               # slim, non-root, tini, everestctl preinstalled
-├── docker-compose.yml       # Volumes for policy.csv & DB; healthchecks
+├── app/
+│   ├── app.py                  # FastAPI routes & startup/health
+│   ├── jobs.py                 # in-memory job store & background tasks
+│   ├── execs.py                # subprocess wrappers with timeouts
+│   ├── k8s.py                  # YAML builders for ResourceQuota/LimitRange
+│   ├── rbac.py                 # policy builder & apply logic
+│   ├── parsers.py              # parse everestctl outputs (json/tabular)
+│   └── __init__.py
+├── tests/
+│   ├── test_accounts_list.py
+│   ├── test_bootstrap_job.py
+│   └── test_parsers.py
 ├── requirements.txt
-├── .env.example             # All envs with docs
-├── README.md                # Step-by-step guide + cURL for every endpoint
-└── tests/
-    ├── conftest.py
-    ├── test_bootstrap.py
-    ├── test_rbac.py
-    ├── test_quotas.py
-    ├── test_cli.py
-    └── test_crd.py
+├── Dockerfile
+├── docker-compose.yml
+├── .dockerignore
+├── .gitignore
+├── .github/workflows/ci.yml
+└── README.md
 ```
 
 ---
 
-## 2) Core capabilities (spec)
+## Implementation Notes
 
-### 2.1 Secure admin API (all require `X-Admin-Key`)
+### Exec wrapper
+`run_cmd(cmd: list[str], input_text: str|None=None, timeout: int=60) -> {exit_code, stdout, stderr}` with:
+- `text=True`, `check=False`, strip ANSI, truncate large outputs
+- Record timestamps and include them in step results
 
-- **Health/Readiness**
-  - `GET /healthz` → 200 if process alive.
-  - `GET /readyz` → runs cached `everestctl version`, checks DB & `policy.csv` path RW.
+### FastAPI specifics
+- Use dependency to validate `X-Admin-Key`
+- Use `BackgroundTasks` or an asyncio task registry (with `asyncio.Lock`) to track job states
+- Return **202** immediately on submission with `job_id`
 
-- **Tenant bootstrap** (idempotent):
-  - `POST /bootstrap/tenant`
-    ```json
-    {
-      "username":"alice",
-      "password":"StrongP@ssw0rd",
-      "namespace":"ns-alice",
-      "operators":{"postgresql":true,"mongodb":false,"xtradb_cluster":true},
-      "idempotency_key": "optional-guid"
-    }
-    ```
-  - Steps:
-    1) `everestctl namespaces add <ns> [--operator.*=true|false]`
-    2) `everestctl accounts create -u <username>` *(skip if exists)*
-    3) `everestctl accounts set-password -u <username>`
-    4) Append **RBAC** for `<ns>` and `<user>`; **atomic** `policy.csv`; `settings rbac validate` then apply (if `APPLY_RBAC=true`).
-    5) Create or update **TenantResourcePolicy** CR in the namespace (defaults).
-    6) Initialize **limits** and **usage** rows in DB; audit all steps.
+### Kube manifests (generated)
+- ResourceQuota and LimitRange derived from inputs; sensible per-container defaults
 
-- **Safe CLI wrappers** (strict argv)
-  - `POST   /cli/accounts/create` → `{ "username": "alice" }`
-  - `POST   /cli/accounts/set-password` → `{ "username":"alice","new_password":"..." }`
-  - `GET    /cli/accounts/list`
-  - `DELETE /cli/accounts` → `{ "username":"alice" }`
-  - `POST   /cli/namespaces/add` → `{ "namespace":"ns-alice","operators":{"postgresql":false},"take_ownership":false }`
-  - `POST   /cli/namespaces/update` → `{ "namespace":"ns-alice","operators":{"mongodb":true} }`
-  - `DELETE /cli/namespaces/remove` → `{ "namespace":"ns-alice","keep_namespace":false }`
-
-- **RBAC admin**
-  - `POST /rbac/append` → append validated `p`/`g` lines; backup + atomic write.
-  - `POST /rbac/can` → `{"user":"alice","resource":"database-clusters","verb":"create","object":"ns-alice/*"}` → uses `everestctl settings rbac can`.
-  - Policy record format: `p, <subject>, <resource-type>, <action>, <resource-name>` and `g, <user>, <role>`.
-
-- **Per‑namespace quotas/limits**
-  - `PUT /limits` → upsert `{ "namespace":"ns-alice","max_clusters":3,"allowed_engines":["postgresql","mysql"],"cpu_limit_cores":4.0,"memory_limit_bytes":17179869184,"max_db_users":20 }`
-  - `GET /limits/{namespace}`
-  - `POST /enforce/cluster-create` → validate engine & headroom for CPU/memory; return **403/429** on violation with clear message.
-  - `POST /usage/register-cluster` → `{ "namespace":"ns-alice","op":"create"|"delete","cpu_cores":1,"memory_bytes":2147483648 }` (transactional counters; never negative).
-  - `POST /usage/register-db-user` → `{ "namespace":"ns-alice","op":"create"|"delete" }`
-
-- **Day‑2 ops**
-  - `DELETE /users` → `{ "username":"alice","namespace":"ns-alice","remove_rbac":true }`
-  - `DELETE /namespaces` → `{ "namespace":"ns-alice","force":false }`
-  - `POST   /users/rotate-password` → `{ "username":"alice","new_password":"..." }`
-
-- **Admin views**
-  - `GET /tenants`, `GET /audit` (filters: actor, namespace, action, since)
-  - `GET /users/raw`, `GET /namespaces/raw` (lightweight CLI list with caching)
-
-### 2.2 Kubernetes CRD for tenant resource policy
-
-Create a namespace‑scoped CRD (group `everest.local`, version `v1`, kind `TenantResourcePolicy`, plural `tenantresourcepolicies`).
-
-**CRD spec (YAML):**
-```yaml
-apiVersion: apiextensions.k8s.io/v1
-kind: CustomResourceDefinition
-metadata:
-  name: tenantresourcepolicies.everest.local
-spec:
-  group: everest.local
-  scope: Namespaced
-  names:
-    kind: TenantResourcePolicy
-    plural: tenantresourcepolicies
-    singular: tenantresourcepolicy
-    shortNames: [trp]
-  versions:
-    - name: v1
-      served: true
-      storage: true
-      schema:
-        openAPIV3Schema:
-          type: object
-          properties:
-            spec:
-              type: object
-              required: [limits, selectors]
-              properties:
-                limits:
-                  type: object
-                  properties:
-                    cpuCores: { type: number, minimum: 0 }
-                    memoryBytes: { type: integer, minimum: 0 }
-                    maxClusters: { type: integer, minimum: 0 }
-                    maxDbUsers: { type: integer, minimum: 0 }
-                selectors:
-                  type: object
-                  properties:
-                    engines:
-                      type: array
-                      items:
-                        type: string
-                        enum: [postgresql, mysql, mongodb, xtradb_cluster]
-```
-
-**Example per‑tenant object (apply to `ns-alice`):**
-```yaml
-apiVersion: everest.local/v1
-kind: TenantResourcePolicy
-metadata:
-  name: resource-policy
-  namespace: ns-alice
-spec:
-  limits:
-    cpuCores: 4
-    memoryBytes: 17179869184  # 16Gi
-    maxClusters: 3
-    maxDbUsers: 20
-  selectors:
-    engines: ["postgresql","mysql"]
-```
-
-The proxy:
-- Creates/updates this CR when bootstrapping or when `/limits` changes.
-- Reads (or watches) it to drive enforcement.
+### Parsers
+- Try `json.loads`; on `JSONDecodeError`, try splitting lines into header/rows by `|` or whitespace
 
 ---
 
-## 3) Security hardening
+## Dockerfile (Production-Ready)
 
-- **Auth**: require `X-Admin-Key` (constant‑time compare). Optionally allow `Authorization: Bearer <token>` if configured.
-- **Rate limiting**: token‑bucket per **client IP** and **route** (`RATE_QPS`, `RATE_BURST`).
-- **Input validation**:
-  - `username`, `namespace`: regex `^[a-z0-9]([-a-z0-9]{1,61}[a-z0-9])?$` (K8s‑safe).
-  - Strict enums for engines/actions; request body size limit.
-- **Subprocess safety**: build argv from allow‑listed verbs only:
-  - `["everestctl","accounts","create","-u",username]`
-  - `["everestctl","accounts","set-password","-u",username]`
-  - `["everestctl","accounts","list"]`
-  - `["everestctl","accounts","delete","-u",username]`
-  - `["everestctl","namespaces","add",ns,"--operator.postgresql=true|false","--operator.mongodb=true|false","--operator.xtradb-cluster=true|false","--take-ownership"(optional)]`
-  - `["everestctl","namespaces","update",ns]`
-  - `["everestctl","namespaces","remove",ns,"--keep-namespace"(optional)]`
-  - `["everestctl","settings","rbac","validate","--policy-file",path?]`
-  - `["everestctl","settings","rbac","can","--policy-file",path?]`
-- **CLI resilience**: env‑driven timeouts (`CLI_TIMEOUT_SEC`) and retries (`CLI_RETRIES`) with exponential backoff on transient errors; redact secrets in logs.
-- **RBAC file safety**: file‑lock, write `policy.csv.tmp`, fsync, atomic rename; rotate backups `policy.csv.bak.<RFC3339>`.
-- **Logging**: JSON logs with `event` names (`http_request`, `cli_run`, `rbac_change`, `quota_enforce`, etc.).
-- **Idempotency**: honor `Idempotency-Key` for POST; store short‑lived keys in DB.
+- Base: `python:3.11-slim`
+- Install:
+  - `curl`, `bash`, `ca-certificates`, `git`
+  - **kubectl** (stable linux/amd64 via official release)
+  - **everestctl**:
+    - Preferred: download official binary to `/usr/local/bin/everestctl` and `chmod +x`
+    - Fallback: `pip install everestctl` (leave comments on switching to binary)
+- Copy code; `pip install -r requirements.txt`
+- `ENV KUBECONFIG=/root/.kube/config`
+- Create non-root user; `USER 10001` (adjust if CLIs require root, document trade-offs)
+- `EXPOSE 8080`
+- Entrypoint:
+  ```
+  uvicorn app.app:app --host 0.0.0.0 --port ${PORT:-8080}
+  ```
 
 ---
 
-## 4) Observability & audit
+## docker-compose.yml
 
-- **Metrics** (optional via `METRICS_ENABLED=true`):
-  - `http_requests_total`, `http_latency_seconds`
-  - `cli_invocations_total{cmd,exit_code}`
-  - `quota_violations_total`
-  - `rate_limit_block_total`
-- **Audit log** (append‑only): who/when/what, namespace/user, request/response hashes, `cli_exit_code/stdout/stderr` (size‑capped).
-- **Readiness** checks include `everestctl version` and (if CRDs enabled) `kubectl version --client`.
-
----
-
-## 5) Configuration (env)
-
-| Var | Purpose | Default |
-|---|---|---|
-| `ADMIN_API_KEY` | **Required** | *(none)* |
-| `POLICY_FILE` | RBAC policy path | `/var/lib/everest/policy/policy.csv` |
-| `APPLY_RBAC` | Validate/apply on change | `true` |
-| `SQLITE_DB` | SQLite path | `/var/lib/everest/data/tenant_proxy.db` |
-| `DATABASE_URL` | Postgres (optional) | *(unset)* |
-| `EVERESTCTL_BIN` | CLI path | `everestctl` |
-| `EVEREST_URL` | Everest API URL (outside cluster) | *(unset)* |
-| `EVEREST_TOKEN` | Everest token (outside cluster) | *(unset)* |
-| `CLI_TIMEOUT_SEC` | Per call timeout | `30` |
-| `CLI_RETRIES` | Retries | `2` |
-| `RATE_QPS`/`RATE_BURST` | Rate limiting | `10` / `20` |
-| `LOG_LEVEL` | Logging level | `INFO` |
-| `METRICS_ENABLED` | `/metrics` | `false` |
+- Service `api`:
+  - Build from `.`
+  - Env:
+    - `ADMIN_API_KEY=${ADMIN_API_KEY:-changeme}`
+    - `PORT=8080`
+    - `KUBECONFIG=/root/.kube/config`
+  - Ports: `8080:8080`
+  - Volumes:
+    - `${HOME}/.kube/config:/root/.kube/config:ro`  # mount host kubeconfig
 
 ---
 
-## 6) RBAC content (per‑tenant role & binding)
+## GitHub Actions: `.github/workflows/ci.yml`
 
-**Minimal, namespace‑scoped policy lines (append to `policy.csv` atomically):**
-```
-# Role for ns-alice
-p, role:tenant-ns-alice, namespaces, read, ns-alice
-p, role:tenant-ns-alice, database-engines, read, ns-alice/*
-p, role:tenant-ns-alice, database-clusters, *, ns-alice/*
-p, role:tenant-ns-alice, database-cluster-backups, *, ns-alice/*
-p, role:tenant-ns-alice, database-cluster-restores, *, ns-alice/*
-p, role:tenant-ns-alice, database-cluster-credentials, read, ns-alice/*
-p, role:tenant-ns-alice, backup-storages, *, ns-alice/*
-p, role:tenant-ns-alice, monitoring-instances, *, ns-alice/*
-
-g, alice, role:tenant-ns-alice
-```
-
-**Validate & test:**
-- `everestctl settings rbac validate [--policy-file <path>]`
-- `everestctl settings rbac can --policy-file <path>` (e.g., can `alice` `create` `database-clusters` on `ns-alice/*`)
+- Trigger: `on: push`
+- **test** job:
+  - `ubuntu-latest`
+  - Setup Python 3.11
+  - Cache pip
+  - `pip install -r requirements.txt`
+  - `pytest -q`
+- **deploy** job (needs: test):
+  - Build: `docker build -t ${{ secrets.REGISTRY }}/${{ github.repository }}:${{ github.sha }} .`
+  - Login: `docker login` using `${{ secrets.REGISTRY_USERNAME }}` / `${{ secrets.REGISTRY_PASSWORD }}`
+  - Push image
+  - Optional K8s deploy step (guard with `if:`):
+    - If kube secrets exist (e.g., `KUBECONFIG_B64`), write kubeconfig and run a templated `kubectl apply -f`.
+    - Otherwise echo “deploy skipped”.
 
 ---
 
-## 7) Docker & deployment
+## Requirements.txt
 
-- **Dockerfile**: `python:3.11-slim`, install `tini` and `everestctl`, create user `appuser`, copy app, `pip install --no-cache-dir -r requirements.txt`.
-- **entrypoint.sh**: fail fast if `ADMIN_API_KEY` or `everestctl` missing; touch/mkdir `policy.csv` dir; run `gunicorn -c gunicorn_conf.py app:app`.
-- **docker-compose.yml**: volumes `./var/policy:/var/lib/everest/policy`, `./var/data:/var/lib/everest/data`; env from `.env`; healthchecks on `/healthz` and `/readyz`.
-
----
-
-## 8) Tests (pytest)
-
-- Mock `subprocess.run` to simulate success / timeouts / non‑zero exits; password prompts for `set-password`/`create`.
-- Assert:
-  - **Correct argv** for every CLI wrapper (no shell, no unexpected flags).
-  - Idempotent bootstrap.
-  - Atomic `policy.csv` with backup & rollback on failure.
-  - Quota enforcement (max clusters, engines, CPU/memory, db users).
-  - Counters stay consistent under concurrency.
-  - Auth, rate‑limit, idempotency behaviors.
-  - CRD create/update and readback round‑trip.
+- `fastapi`
+- `uvicorn[standard]`
+- `pydantic`
+- `pytest`
+- `httpx`
+- `python-dateutil`
+- (optional) `uvloop` on Linux
 
 ---
 
-## 9) Example cURL (mirror to README)
+## README Snippets (include verbatim)
 
+**Quickstart**
 ```bash
-# Health/ready
-curl -fsS localhost:8080/healthz
-curl -fsS -H "X-Admin-Key: $ADMIN_API_KEY" localhost:8080/readyz
-
-# Bootstrap
-curl -X POST localhost:8080/bootstrap/tenant \
-  -H "X-Admin-Key: $ADMIN_API_KEY" -H "Content-Type: application/json" \
-  -d '{"username":"bob","password":"AnotherP@ss1","namespace":"ns-bob",
-       "operators":{"postgresql":true,"mongodb":true,"xtradb_cluster":false}}'
-
-# Alice bootstrap
-curl -X POST localhost:8080/bootstrap/tenant \
-  -H "X-Admin-Key: $ADMIN_API_KEY" -H "Content-Type: application/json" \
-  -d '{"username":"alice","password":"StrongP@ssw0rd","namespace":"ns-alice",
-      "operators":{"postgresql":true,"mongodb":false,"xtradb_cluster":true}
-    },
-    {
-      "username":"bob","password":"AnotherP@ss1","namespace":"ns-bob",
-       "operators":{"postgresql":true,"mongodb":false,"xtradb_cluster":true}}'
-
-# CLI accounts
-curl -X POST   localhost:8080/cli/accounts/create -H "X-Admin-Key: $ADMIN_API_KEY" \
-  -H "Content-Type: application/json" -d '{"username":"alice"}'
-
-curl -X POST   localhost:8080/cli/accounts/set-password -H "X-Admin-Key: $ADMIN_API_KEY" \
-  -H "Content-Type: application/json" -d '{"username":"alice","new_password":"NewP@ss"}'
-
-curl -X GET    localhost:8080/cli/accounts/list -H "X-Admin-Key: $ADMIN_API_KEY"
-
-curl -X DELETE localhost:8080/cli/accounts -H "X-Admin-Key: $ADMIN_API_KEY" \
-  -H "Content-Type: application/json" -d '{"username":"alice"}'
-
-# Namespaces
-curl -X POST localhost:8080/cli/namespaces/add -H "X-Admin-Key: $ADMIN_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"namespace":"ns-alice","operators":{"postgresql":false}}'
-
-curl -X POST localhost:8080/cli/namespaces/update -H "X-Admin-Key: $ADMIN_API_KEY" \
-  -H "Content-Type: application/json" -d '{"namespace":"ns-alice","operators":{"mongodb":true}}'
-
-curl -X DELETE localhost:8080/cli/namespaces/remove -H "X-Admin-Key: $ADMIN_API_KEY" \
-  -H "Content-Type: application/json" -d '{"namespace":"ns-alice","keep_namespace":true}'
-
-# RBAC check
-curl -X POST localhost:8080/rbac/can -H "X-Admin-Key: $ADMIN_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"user":"alice","resource":"database-clusters","verb":"create","object":"ns-alice/*"}'
-
-# Limits / enforce / usage
-curl -X PUT localhost:8080/limits -H "X-Admin-Key: $ADMIN_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"namespace":"ns-alice","max_clusters":3,"allowed_engines":["postgresql","mysql"],
-       "cpu_limit_cores":4,"memory_limit_bytes":17179869184,"max_db_users":20}'
-
-curl -X POST localhost:8080/enforce/cluster-create -H "X-Admin-Key: $ADMIN_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"namespace":"ns-alice","engine":"postgresql","cpu_request_cores":1,"memory_request_bytes":2147483648}'
-
-curl -X POST localhost:8080/usage/register-cluster -H "X-Admin-Key: $ADMIN_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"namespace":"ns-alice","op":"create","cpu_cores":1,"memory_bytes":2147483648}'
-
-# CRD (via kubectl)
-kubectl apply -f kubernetes/crd-tenantresourcepolicy.yaml
-kubectl -n ns-alice apply -f - <<'YAML'
-apiVersion: everest.local/v1
-kind: TenantResourcePolicy
-metadata: { name: resource-policy }
-spec:
-  limits: { cpuCores: 4, memoryBytes: 17179869184, maxClusters: 3, maxDbUsers: 20 }
-  selectors: { engines: ["postgresql","mysql"] }
-YAML
+docker-compose up --build -d
+export BASE_URL="http://localhost:8080"
+export ADMIN_API_KEY="changeme"
 ```
+
+**Submit a bootstrap job**
+```bash
+curl -sS -X POST "$BASE_URL/bootstrap/users" \
+  -H "X-Admin-Key: $ADMIN_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{ "username": "alice" }'
+# => { "job_id": "...", "status_url": "/jobs/..." }
+```
+
+**Check job**
+```bash
+curl -sS "$BASE_URL/jobs/<JOB_ID>" -H "X-Admin-Key: $ADMIN_API_KEY"
+```
+
+**Get result**
+```bash
+curl -sS "$BASE_URL/jobs/<JOB_ID>/result" -H "X-Admin-Key: $ADMIN_API_KEY"
+```
+
+**List accounts**
+```bash
+curl -sS -X GET "$BASE_URL/accounts/list" -H "X-Admin-Key: $ADMIN_API_KEY"
+```
+
+**Notes**
+- Works **async**: submit → poll → fetch result.
+- Container expects kubeconfig mounted at `/root/.kube/config`.
+---
+
+## Percona Everest Docs
+
+- Main docs: https://docs.percona.com/everest/
+- Ensure CLI usage (`everestctl`) matches the version you install in the Dockerfile; keep the install URL/version configurable.
 
 ---
 
-## 10) Acceptance checklist
+## Acceptance Criteria
 
-- `/readyz` returns 200 and confirms **`everestctl`** callable.
-- Bootstrap performs: namespace add → user create → set password → RBAC append/validate → CRD upsert → DB init.
-- CLI wrappers reject unsafe input; argv equals spec.
-- Quotas enforced; counters consistent under concurrency.
-- `policy.csv` writes are atomic with backups & rollback.
-- JSON logs & (optional) Prometheus metrics.
-- Tests pass in container; README examples work.
+- Submitting `POST /bootstrap/users` returns **202 + job id**.
+- Polling `/jobs/{id}` shows progress.
+- Fetching `/jobs/{id}/result` returns structured step-by-step output.
+- Docker image runs with both CLIs available and honors `KUBECONFIG`.
+- docker-compose mounts kubeconfig from host and exposes port 8080.
+- CI runs tests then builds & pushes image (deploy optional).
+- README documents setup, usage, and async job flow.
