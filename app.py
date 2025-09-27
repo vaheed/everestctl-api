@@ -47,6 +47,12 @@ class Settings(BaseModel):
     HEALTH_STARTUP_PROBE_CMD: str = Field(default_factory=lambda: os.getenv("HEALTH_STARTUP_PROBE_CMD", "version"))
     # Rate limiter burst (per minute window)
     RATE_LIMIT_BURST: int = Field(default_factory=lambda: int(os.getenv("RATE_LIMIT_BURST", "150")))
+    # Enable if using SSO; skips local user creation/password ops
+    SSO_ENABLED: bool = Field(default_factory=lambda: os.getenv("SSO_ENABLED", "false").lower() == "true")
+    # Validate RBAC via everestctl `settings rbac validate` after changes
+    RBAC_VALIDATE_ON_CHANGE: bool = Field(default_factory=lambda: os.getenv("RBAC_VALIDATE_ON_CHANGE", "true").lower() == "true")
+    # Some everestctl subcommands require a TTY; emulate with PTY if needed
+    CLI_FORCE_PTY: bool = Field(default_factory=lambda: os.getenv("CLI_FORCE_PTY", "true").lower() == "true")
 
     @field_validator("EVERESTCTL_PATH")
     @classmethod
@@ -280,6 +286,7 @@ class TenantRequest(BaseModel):
     namespace: str
     password: str
     engine: str = Field(..., description="Database engine, must be allowed")
+    operators: Optional[List[str]] = Field(default=None, description="Optional DB operators to enable for the namespace")
 
 class RotatePasswordRequest(BaseModel):
     user: str
@@ -348,6 +355,48 @@ def rbac_remove(path: str, user: str, namespace: str):
     except FileLockTimeout:
         raise HTTPException(503, "policy lock timeout")
 
+async def rbac_write_and_validate(path: str, new_rows: List[List[str]], validator):
+    """Write policy rows atomically then run validator(); on failure, roll back to original content."""
+    original_rows = read_policy(path)
+    try:
+        write_policy_atomic(path, new_rows)
+        await validator()
+    except Exception:
+        # Roll back to original rows and re-raise
+        write_policy_atomic(path, original_rows)
+        raise
+
+async def rbac_add_validate_if_enabled(settings: Settings, user: str, namespace: str):
+    path = settings.RBAC_POLICY_PATH
+    if not settings.RBAC_VALIDATE_ON_CHANGE:
+        return rbac_add(path, user, namespace)
+    try:
+        with FileLock(path + ".lock", timeout=10):
+            rows = read_policy(path)
+            entry = ["p", user, namespace, "write"]
+            if entry in rows:
+                return
+            rows_with = rows + [entry]
+            async def _validate():
+                await run_cli(settings, ["settings", "rbac", "validate"])
+            await rbac_write_and_validate(path, rows_with, _validate)
+    except FileLockTimeout:
+        raise HTTPException(503, "policy lock timeout")
+
+async def rbac_remove_validate_if_enabled(settings: Settings, user: str, namespace: str):
+    path = settings.RBAC_POLICY_PATH
+    if not settings.RBAC_VALIDATE_ON_CHANGE:
+        return rbac_remove(path, user, namespace)
+    try:
+        with FileLock(path + ".lock", timeout=10):
+            rows = read_policy(path)
+            filtered = [r for r in rows if not (len(r) >= 4 and r[0] == "p" and r[1] == user and r[2] == namespace)]
+            async def _validate():
+                await run_cli(settings, ["settings", "rbac", "validate"])
+            await rbac_write_and_validate(path, filtered, _validate)
+    except FileLockTimeout:
+        raise HTTPException(503, "policy lock timeout")
+
 # -------------------- CLI Wrapper --------------------
 
 def _mask_secrets(args: List[str]) -> List[str]:
@@ -365,27 +414,31 @@ def _mask_secrets(args: List[str]) -> List[str]:
 async def run_cli(settings: Settings, args: List[str]) -> Dict[str, Any]:
     """Safely run everestctl with validated args and timeouts/retries."""
     cmd = [settings.EVERESTCTL_PATH] + args
-    # Validate: only allow safe characters in args (letters, digits, dashes, underscores, dots, slashes, equals)
+    # Validate: only allow safe characters in args (letters, digits, dashes, underscores, dots, slashes, equals, colon, comma)
     for a in cmd:
-        if not all(c.isalnum() or c in "-_./=:" for c in a):
+        if not all(c.isalnum() or c in "-_./=:," for c in a):
             raise HTTPException(400, f"invalid character in arg: {a}")
     last_exc = None
     for attempt in range(settings.REQUEST_RETRIES + 1):
         try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            try:
-                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=settings.REQUEST_TIMEOUT_SEC)
-            except asyncio.TimeoutError:
-                proc.kill()
-                stdout, stderr = await proc.communicate()
-                raise TimeoutError("everestctl timed out")
-            rc = proc.returncode
-            out = stdout.decode(errors="replace").strip()
-            err = stderr.decode(errors="replace").strip()
+            if settings.CLI_FORCE_PTY:
+                # Emulate a TTY using a PTY so everestctl won't try to open /dev/tty
+                rc, out, err = await _run_with_pty(cmd, settings.REQUEST_TIMEOUT_SEC)
+            else:
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                try:
+                    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=settings.REQUEST_TIMEOUT_SEC)
+                except asyncio.TimeoutError:
+                    proc.kill()
+                    stdout, stderr = await proc.communicate()
+                    raise TimeoutError("everestctl timed out")
+                rc = proc.returncode
+                out = stdout.decode(errors="replace").strip()
+                err = stderr.decode(errors="replace").strip()
             cli_runs.labels(" ".join(args[:2]), "ok" if rc==0 else "error").inc()
             logger.info(
                 "",
@@ -405,6 +458,67 @@ async def run_cli(settings: Settings, args: List[str]) -> Dict[str, Any]:
             last_exc = e
             await asyncio.sleep(min(0.25 * (2**attempt), 2.0))
     raise HTTPException(502, f"CLI failed after retries: {last_exc}")
+
+async def _run_with_pty(cmd: List[str], timeout: int) -> (int, str, str):
+    """Run a command attached to a PTY and capture combined output.
+    Returns (rc, stdout, stderr_text_placeholder) where stderr is folded into stdout.
+    """
+    import os, signal
+    master_fd, slave_fd = os.openpty()
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdin=slave_fd,
+            stdout=slave_fd,
+            stderr=slave_fd,
+            preexec_fn=os.setsid,
+        )
+        os.close(slave_fd)
+        buf = bytearray()
+
+        async def reader():
+            while True:
+                try:
+                    chunk = await asyncio.to_thread(os.read, master_fd, 4096)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                buf.extend(chunk)
+
+        rtask = asyncio.create_task(reader())
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(proc.pid, signal.SIGKILL)
+            await proc.wait()
+            rtask.cancel()
+            raise TimeoutError("everestctl timed out")
+        # Allow small drain
+        await asyncio.sleep(0.05)
+        rtask.cancel()
+        out = buf.decode(errors="replace").strip()
+        return proc.returncode, out, ""
+    finally:
+        try:
+            os.close(master_fd)
+        except Exception:
+            pass
+
+async def run_cli_idempotent(settings: Settings, args: List[str], ignore_patterns: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
+    """Run CLI and ignore known harmless errors for idempotency.
+    Returns result or None if ignored as already-in-desired-state.
+    """
+    try:
+        return await run_cli(settings, args)
+    except HTTPException as e:
+        msg = str(e.detail)
+        pats = ignore_patterns or []
+        if any(p.lower() in msg.lower() for p in pats):
+            logger.info("", extra={"event": "cli_run", "extras": {"args": _mask_secrets(args), "rc": "ignored", "reason": "idempotent"}})
+            return None
+        raise
 
 def parse_accounts_table(text: str) -> List[Dict[str, Any]]:
     """Parse `everestctl accounts list` tabular output into a list of dicts.
@@ -538,12 +652,17 @@ def ensure_cluster_quota(settings: Settings, tenant: str):
 async def create_tenant(req: TenantRequest, _: None = Depends(api_key_auth), s: Settings = Depends(get_settings)):
     ensure_engine_allowed(s, req.engine)
     ensure_cluster_quota(s, req.user)
-    # Call CLI to create namespace/user with safe args (example commands)
-    # Note: Commands below follow Everest CLI conventions.
-    await run_cli(s, ["namespaces", "add", req.namespace])
-    await run_cli(s, ["accounts", "create", "-u", req.user])
-    await run_cli(s, ["accounts", "set-password", "-u", req.user, "-p", req.password])
-    rbac_add(s.RBAC_POLICY_PATH, req.user, req.namespace)
+    # Create namespace (idempotent)
+    ns_args = ["namespaces", "add", req.namespace]
+    if req.operators:
+        ns_args += ["--operators", ",".join(req.operators)]
+    await run_cli_idempotent(s, ns_args, ignore_patterns=["already exists", "exists", "AlreadyExists", "Conflict"])
+    # Create local user if not using SSO
+    if not s.SSO_ENABLED:
+        await run_cli_idempotent(s, ["accounts", "create", "-u", req.user], ignore_patterns=["already exists", "exists", "AlreadyExists", "Conflict"])
+        await run_cli(s, ["accounts", "set-password", "-u", req.user, "-p", req.password])
+    # RBAC update with optional validation
+    await rbac_add_validate_if_enabled(s, req.user, req.namespace)
     inc_counter(s.DB_PATH, req.user, +1)
     audit(
         s.DB_PATH,
@@ -557,9 +676,9 @@ async def create_tenant(req: TenantRequest, _: None = Depends(api_key_auth), s: 
 
 @app.post("/tenants/delete")
 async def delete_tenant(req: DeleteTenantRequest, _: None = Depends(api_key_auth), s: Settings = Depends(get_settings)):
-    await run_cli(s, ["namespaces", "delete", req.namespace])
-    await run_cli(s, ["accounts", "delete", "-u", req.user])
-    rbac_remove(s.RBAC_POLICY_PATH, req.user, req.namespace)
+    await run_cli_idempotent(s, ["namespaces", "delete", req.namespace], ignore_patterns=["not found", "does not exist", "NotFound"])
+    await run_cli_idempotent(s, ["accounts", "delete", "-u", req.user], ignore_patterns=["not found", "does not exist", "NotFound"])
+    await rbac_remove_validate_if_enabled(s, req.user, req.namespace)
     inc_counter(s.DB_PATH, req.user, -1)
     audit(s.DB_PATH, actor="api", action="tenant_delete", target=req.user, details=req.dict())
     logger.info("", extra={"event":"rbac_change","extras":{"op":"remove","user":req.user,"namespace":req.namespace}})
@@ -567,6 +686,8 @@ async def delete_tenant(req: DeleteTenantRequest, _: None = Depends(api_key_auth
 
 @app.post("/tenants/rotate-password")
 async def rotate_password(req: RotatePasswordRequest, _: None = Depends(api_key_auth), s: Settings = Depends(get_settings)):
+    if s.SSO_ENABLED:
+        raise HTTPException(400, "password rotation is disabled when SSO is enabled")
     await run_cli(s, ["accounts", "set-password", "-u", req.user, "-p", req.new_password])
     audit(s.DB_PATH, actor="api", action="password_rotate", target=req.user, details={"user": req.user})
     return {"status":"rotated", "user": req.user}

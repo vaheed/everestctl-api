@@ -74,10 +74,14 @@ docker compose -f docker-compose.prod.yml up -d
 | `GUNICORN_TIMEOUT` | `60` | Worker timeout |
 | `GUNICORN_GRACEFUL_TIMEOUT` | `30` | Graceful timeout |
 | `SKIP_CLI_CHECK` | `false` | Skip CLI presence check (tests/dev) |
+| `SSO_ENABLED` | `false` | If true, skip local user creation and password operations; only RBAC is applied |
+| `RBAC_VALIDATE_ON_CHANGE` | `true` | Run `everestctl settings rbac validate` after policy changes and roll back on failure |
+| `CLI_FORCE_PTY` | `true` | Allocate a pseudo-TTY for `everestctl` to avoid TTY errors in non-interactive environments |
 
 ## API
 
 All endpoints require header: `X-API-Key: <your API key>`.
+Create is idempotent: existing namespaces/users are treated as success; delete ignores missing resources.
 
 ### Health
 
@@ -92,7 +96,7 @@ curl -s localhost:8080/readyz | jq
 curl -X POST localhost:8080/tenants/create \
   -H "Content-Type: application/json" \
   -H "X-API-Key: $API_KEY" \
-  -d '{"user":"alice","namespace":"ns-alice","password":"S3cret!","engine":"postgres"}'
+  -d '{"user":"alice","namespace":"ns-alice","password":"S3cret!","engine":"postgres","operators":["postgres","mysql"]}'
 ```
 
 ### Delete tenant
@@ -112,6 +116,7 @@ curl -X POST localhost:8080/tenants/rotate-password \
   -H "X-API-Key: $API_KEY" \
   -d '{"user":"alice","new_password":"NewS3cret!"}'
 ```
+Note: when `SSO_ENABLED=true`, password rotation returns HTTP 400 and is disabled.
 
 ### User management
 
