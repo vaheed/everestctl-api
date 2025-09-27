@@ -1,4 +1,3 @@
-import json
 import multiprocessing
 import os
 
@@ -9,14 +8,10 @@ accesslog = "-"
 errorlog = "-"
 loglevel = os.environ.get("LOG_LEVEL", "info").lower()
 
-def access_log_format(sock, addr, request, response, environ, request_time):
-    payload = {
-        "event": "http_access",
-        "remote": addr[0] if addr else None,
-        "method": request.method,
-        "path": request.path,
-        "status": response.status,
-        "duration_ms": int(request_time * 1000),
-    }
-    return json.dumps(payload)
-
+# Gunicorn expects a format string, not a callable, for access logs.
+# JSON-like format using documented placeholders.
+access_log_format = (
+    '{"event":"http_access","remote":"%(h)s","time":"%(t)s",'
+    '"request":"%(r)s","status":%(s)s,"length":"%(b)s","referer":"%(f)s",'
+    '"agent":"%(a)s","duration":"%(L)s"}'
+)
