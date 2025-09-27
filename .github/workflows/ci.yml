@@ -30,6 +30,7 @@ jobs:
           ADMIN_API_KEY: test-key
           SQLITE_DB: ${{ github.workspace }}/.tmp/tenant_proxy_test.db
           POLICY_FILE: ${{ github.workspace }}/.tmp/policy.csv
+          PYTHONPATH: ${{ github.workspace }}
         run: |
           mkdir -p .tmp
           pytest -q
@@ -85,4 +86,3 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-

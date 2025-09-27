@@ -1,7 +1,13 @@
 import os
+import sys
 import types
 import pytest
 from fastapi.testclient import TestClient
+
+# Ensure repository root is importable (so 'import cli', 'import app', etc.)
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
 
 import cli as cli_module
 

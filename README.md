@@ -25,8 +25,7 @@ Notes
 - RBAC writes to `POLICY_FILE` atomically with timestamped backups and validates via everestctl.
 - Idempotency: POST honors Idempotency-Key and replays responses.
 - Metrics: enable with `METRICS_ENABLED=true` then GET /metrics.
-- CRD manifests under `kubernetes/`. The app best-effort applies per-tenant policy via kubectl if present.
-- kubectl and everestctl are installed in the image; KUBECONFIG is exported to `/data/kubeconfig` and docker-compose mounts `${KUBECONFIG_HOST_PATH:-${HOME}/.kube/config}` there (read-only).
+- The API manages per-tenant CRDs automatically during bootstrap and limit updates — no need to run kubectl manually.
 
 Testing
 - `pytest` (CLI calls are mocked by tests).
@@ -82,46 +81,46 @@ curl -sS -X POST $BASE_URL/bootstrap/tenant \
       }'
 ```
 
-Safe CLI wrappers (accounts)
+Accounts (API wrappers)
 ```bash
-# Create user
+# Create user (Alice)
 curl -sS -X POST $BASE_URL/cli/accounts/create \
   -H "X-Admin-Key: $ADMIN_API_KEY" -H "Content-Type: application/json" \
   -d '{"username":"alice"}'
 
-# Set password
+# Set password (Alice)
 curl -sS -X POST $BASE_URL/cli/accounts/set-password \
   -H "X-Admin-Key: $ADMIN_API_KEY" -H "Content-Type: application/json" \
   -d '{"username":"alice","new_password":"NewP@ss"}'
 
-# List users
+# List users (raw output)
 curl -sS -X GET $BASE_URL/cli/accounts/list -H "X-Admin-Key: $ADMIN_API_KEY"
 
-# Delete user
+# Delete user (Alice)
 curl -sS -X DELETE $BASE_URL/cli/accounts \
   -H "X-Admin-Key: $ADMIN_API_KEY" -H "Content-Type: application/json" \
   -d '{"username":"alice"}'
 ```
 
-Safe CLI wrappers (namespaces)
+Namespaces (API wrappers)
 ```bash
-# Add namespace (enable postgres operator only)
+# Add namespace for Alice (enable postgres operator only, do not take ownership)
 curl -sS -X POST $BASE_URL/cli/namespaces/add \
   -H "X-Admin-Key: $ADMIN_API_KEY" -H "Content-Type: application/json" \
-  -d '{"namespace":"ns-alice","operators":{"postgresql":false}}'
+  -d '{"namespace":"ns-alice","operators":{"postgresql":false},"take_ownership":false}'
 
-# Update namespace (enable mongodb)
+# Update namespace (enable mongodb for Alice)
 curl -sS -X POST $BASE_URL/cli/namespaces/update \
   -H "X-Admin-Key: $ADMIN_API_KEY" -H "Content-Type: application/json" \
   -d '{"namespace":"ns-alice","operators":{"mongodb":true}}'
 
-# Remove namespace (keep K8s namespace)
+# Remove namespace (keep K8s namespace for Alice)
 curl -sS -X DELETE $BASE_URL/cli/namespaces/remove \
   -H "X-Admin-Key: $ADMIN_API_KEY" -H "Content-Type: application/json" \
   -d '{"namespace":"ns-alice","keep_namespace":true}'
 ```
 
-RBAC administration
+RBAC administration (all via API)
 ```bash
 # Append policy lines (atomic write + validate if APPLY_RBAC=true)
 cat > /tmp/policy_lines.txt <<'EOF'
@@ -140,13 +139,18 @@ curl -sS -X POST $BASE_URL/rbac/append \
   -H "X-Admin-Key: $ADMIN_API_KEY" -H "Content-Type: application/json" \
   -d "$(jq -Rn --slurpfile lines /tmp/policy_lines.txt '{lines:$lines|.[0]|split("\n")|map(select(length>0))}')"
 
-# Can check
+# Can check for Alice
 curl -sS -X POST $BASE_URL/rbac/can \
   -H "X-Admin-Key: $ADMIN_API_KEY" -H "Content-Type: application/json" \
   -d '{"user":"alice","resource":"database-clusters","verb":"create","object":"ns-alice/*"}'
+
+# Can check for Bob
+curl -sS -X POST $BASE_URL/rbac/can \
+  -H "X-Admin-Key: $ADMIN_API_KEY" -H "Content-Type: application/json" \
+  -d '{"user":"bob","resource":"database-clusters","verb":"create","object":"ns-bob/*"}'
 ```
 
-Per‑namespace limits
+Per‑namespace limits (Alice and Bob)
 ```bash
 # Upsert limits for Alice
 curl -sS -X PUT $BASE_URL/limits \
@@ -160,52 +164,87 @@ curl -sS -X PUT $BASE_URL/limits \
         "max_db_users":20
       }'
 
-# Read limits
+# Read limits (Alice)
 curl -sS -X GET $BASE_URL/limits/ns-alice -H "X-Admin-Key: $ADMIN_API_KEY"
+
+# Upsert limits for Bob
+curl -sS -X PUT $BASE_URL/limits \
+  -H "X-Admin-Key: $ADMIN_API_KEY" -H "Content-Type: application/json" \
+  -d '{
+        "namespace":"ns-bob",
+        "max_clusters":5,
+        "allowed_engines":["postgresql","mongodb"],
+        "cpu_limit_cores":8,
+        "memory_limit_bytes":34359738368,
+        "max_db_users":40
+      }'
+
+# Read limits (Bob)
+curl -sS -X GET $BASE_URL/limits/ns-bob -H "X-Admin-Key: $ADMIN_API_KEY"
 ```
 
 Enforcement checks
 ```bash
-# Validate headroom for a new cluster
+# Validate headroom for a new cluster (Alice)
 curl -sS -X POST $BASE_URL/enforce/cluster-create \
   -H "X-Admin-Key: $ADMIN_API_KEY" -H "Content-Type: application/json" \
   -d '{"namespace":"ns-alice","engine":"postgresql","cpu_request_cores":1,"memory_request_bytes":2147483648}'
+
+# Validate headroom for a new cluster (Bob)
+curl -sS -X POST $BASE_URL/enforce/cluster-create \
+  -H "X-Admin-Key: $ADMIN_API_KEY" -H "Content-Type: application/json" \
+  -d '{"namespace":"ns-bob","engine":"mongodb","cpu_request_cores":2,"memory_request_bytes":4294967296}'
 ```
 
 Usage counters
 ```bash
-# Register cluster create (increments usage)
+# Register cluster create (increments usage for Alice)
 curl -sS -X POST $BASE_URL/usage/register-cluster \
   -H "X-Admin-Key: $ADMIN_API_KEY" -H "Content-Type: application/json" \
   -d '{"namespace":"ns-alice","op":"create","cpu_cores":1,"memory_bytes":2147483648}'
 
-# Register DB user create
+# Register DB user create (Alice)
 curl -sS -X POST $BASE_URL/usage/register-db-user \
   -H "X-Admin-Key: $ADMIN_API_KEY" -H "Content-Type: application/json" \
   -d '{"namespace":"ns-alice","op":"create"}'
 
-# Register cluster delete (decrements usage)
+# Register cluster delete (decrements usage for Alice)
 curl -sS -X POST $BASE_URL/usage/register-cluster \
   -H "X-Admin-Key: $ADMIN_API_KEY" -H "Content-Type: application/json" \
   -d '{"namespace":"ns-alice","op":"delete","cpu_cores":1,"memory_bytes":2147483648}'
+
+# Register cluster create (Bob)
+curl -sS -X POST $BASE_URL/usage/register-cluster \
+  -H "X-Admin-Key: $ADMIN_API_KEY" -H "Content-Type: application/json" \
+  -d '{"namespace":"ns-bob","op":"create","cpu_cores":2,"memory_bytes":4294967296}'
+
+# Register DB user create (Bob)
+curl -sS -X POST $BASE_URL/usage/register-db-user \
+  -H "X-Admin-Key: $ADMIN_API_KEY" -H "Content-Type: application/json" \
+  -d '{"namespace":"ns-bob","op":"create"}'
 ```
 
 Day‑2 operations
 ```bash
-# Remove user (and later optionally remove RBAC via /rbac/append with a cleaned policy)
+# Remove user (Alice)
 curl -sS -X DELETE $BASE_URL/users \
   -H "X-Admin-Key: $ADMIN_API_KEY" -H "Content-Type: application/json" \
   -d '{"username":"bob"}'
 
-# Remove namespace entirely (force=false path uses everestctl namespaces remove)
+# Remove namespace entirely (Bob)
 curl -sS -X DELETE $BASE_URL/namespaces \
   -H "X-Admin-Key: $ADMIN_API_KEY" -H "Content-Type: application/json" \
   -d '{"namespace":"ns-bob","force":false,"keep_namespace":false}'
 
-# Rotate password
+# Rotate password (Alice)
 curl -sS -X POST $BASE_URL/users/rotate-password \
   -H "X-Admin-Key: $ADMIN_API_KEY" -H "Content-Type: application/json" \
   -d '{"username":"alice","new_password":"EvenStrongerP@ss2"}'
+
+# Rotate password (Bob)
+curl -sS -X POST $BASE_URL/users/rotate-password \
+  -H "X-Admin-Key: $ADMIN_API_KEY" -H "Content-Type: application/json" \
+  -d '{"username":"bob","new_password":"AnotherP@ss2"}'
 ```
 
 Admin views
@@ -216,15 +255,15 @@ curl -sS -H "X-Admin-Key: $ADMIN_API_KEY" $BASE_URL/users/raw
 curl -sS -H "X-Admin-Key: $ADMIN_API_KEY" $BASE_URL/namespaces/raw
 ```
 
-CRD artifacts
-```bash
-kubectl apply -f kubernetes/crd-tenantresourcepolicy.yaml
-kubectl -n ns-alice apply -f - <<'YAML'
-apiVersion: everest.local/v1
-kind: TenantResourcePolicy
-metadata: { name: resource-policy }
-spec:
-  limits: { cpuCores: 4, memoryBytes: 17179869184, maxClusters: 3, maxDbUsers: 20 }
-  selectors: { engines: ["postgresql","mysql"] }
-YAML
-```
+Idempotency
+- For POST/PUT/DELETE, set an Idempotency-Key header (UUID recommended) to safely retry without duplicating operations.
+- Example header: `-H "Idempotency-Key: 33333333-3333-3333-3333-333333333333"`
+# Add namespace for Bob (enable postgres and mongodb, take ownership)
+curl -sS -X POST $BASE_URL/cli/namespaces/add \
+  -H "X-Admin-Key: $ADMIN_API_KEY" -H "Content-Type: application/json" \
+  -d '{"namespace":"ns-bob","operators":{"postgresql":true,"mongodb":true,"xtradb_cluster":false},"take_ownership":true}'
+
+# Remove namespace for Bob (delete K8s namespace)
+curl -sS -X DELETE $BASE_URL/cli/namespaces/remove \
+  -H "X-Admin-Key: $ADMIN_API_KEY" -H "Content-Type: application/json" \
+  -d '{"namespace":"ns-bob","keep_namespace":false}'
