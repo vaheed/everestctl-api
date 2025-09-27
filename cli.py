@@ -52,7 +52,13 @@ def _mask(argv: List[str]) -> List[str]:
     return masked
 
 
-def run(argv: List[str], timeout: Optional[int] = None, retries: Optional[int] = None, stdin_input: Optional[str] = None) -> Tuple[int, str, str]:
+def run(
+    argv: List[str],
+    timeout: Optional[int] = None,
+    retries: Optional[int] = None,
+    stdin_input: Optional[str] = None,
+    use_pty: bool = False,
+) -> Tuple[int, str, str]:
     if not argv or argv[0] != "everestctl":
         raise ValueError("must invoke everestctl")
     if not _is_allowed(argv):
@@ -69,18 +75,71 @@ def run(argv: List[str], timeout: Optional[int] = None, retries: Optional[int] =
         attempt += 1
         start = time.time()
         try:
-            proc = subprocess.run(
-                argv,
-                input=stdin_input,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=timeout,
-                check=False,
-                text=True,
-            )
-            code = proc.returncode
-            out = proc.stdout
-            err = proc.stderr
+            if use_pty:
+                import os
+                import select
+
+                master, slave = os.openpty()
+                try:
+                    proc = subprocess.Popen(
+                        argv,
+                        stdin=slave,
+                        stdout=slave,
+                        stderr=slave,
+                        close_fds=True,
+                        text=False,
+                    )
+                    os.close(slave)
+                    out_chunks: List[str] = []
+                    start_wait = time.time()
+                    # We generally do not need to send stdin for create; if provided, write it.
+                    if stdin_input:
+                        os.write(master, stdin_input.encode())
+                    while True:
+                        if timeout and (time.time() - start_wait) > timeout:
+                            proc.kill()
+                            code, out, err = 124, "", f"timeout after {timeout}s"
+                            break
+                        r, _, _ = select.select([master], [], [], 0.1)
+                        if r:
+                            try:
+                                data = os.read(master, 8192)
+                            except OSError:
+                                data = b""
+                            if data:
+                                out_chunks.append(data.decode(errors="ignore"))
+                        if proc.poll() is not None:
+                            # Drain remaining
+                            try:
+                                while True:
+                                    data = os.read(master, 8192)
+                                    if not data:
+                                        break
+                                    out_chunks.append(data.decode(errors="ignore"))
+                            except OSError:
+                                pass
+                            code = proc.returncode
+                            out = "".join(out_chunks)
+                            err = ""
+                            break
+                finally:
+                    try:
+                        os.close(master)
+                    except Exception:
+                        pass
+            else:
+                proc = subprocess.run(
+                    argv,
+                    input=stdin_input,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=timeout,
+                    check=False,
+                    text=True,
+                )
+                code = proc.returncode
+                out = proc.stdout
+                err = proc.stderr
         except subprocess.TimeoutExpired as e:
             code, out, err = 124, e.stdout or "", e.stderr or f"timeout after {timeout}s"
 
@@ -105,7 +164,9 @@ def run(argv: List[str], timeout: Optional[int] = None, retries: Optional[int] =
 
 # Convenience builders matching the spec
 def accounts_create(username: str) -> Tuple[int, str, str]:
-    return run(["everestctl", "accounts", "create", "-u", username])
+    # Some versions of everestctl attempt to open /dev/tty for interactive prompts during create.
+    # Allocate a PTY so it can proceed non-interactively.
+    return run(["everestctl", "accounts", "create", "-u", username], use_pty=True)
 
 
 def accounts_set_password(username: str, new_password: Optional[str] = None) -> Tuple[int, str, str]:

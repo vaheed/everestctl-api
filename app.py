@@ -207,8 +207,29 @@ def api_accounts_set_password(req: AccountsSetPassword, _: Any = Depends(require
 
 @app.get("/cli/accounts/list")
 def api_accounts_list(_: Any = Depends(require_key_dep), __: Any = Depends(rate_limit_dep)):
+    import re
+
     code, out, err = cli.accounts_list()
-    return JSONResponse(status_code=200 if code == 0 else 500, content={"exit_code": code, "stdout": out, "stderr": err})
+    content: Dict[str, Any] = {"exit_code": code, "stderr": err}
+    if code == 0:
+        lines = [ln for ln in out.splitlines() if ln.strip()]
+        users = []
+        if lines:
+            # Split columns on 2+ spaces
+            header = re.split(r"\s{2,}", lines[0].strip().lower())
+            for row in lines[1:]:
+                parts = re.split(r"\s{2,}", row.strip())
+                if len(parts) < 3:
+                    continue
+                user = parts[0]
+                caps = parts[1].strip().strip("[]").replace(" ", "")
+                capabilities = [c for c in caps.split(",") if c]
+                enabled = parts[2].strip().lower() == "true"
+                users.append({"user": user, "capabilities": capabilities, "enabled": enabled})
+        content["users"] = users
+    else:
+        content["raw_stdout"] = out
+    return JSONResponse(status_code=200 if code == 0 else 500, content=content)
 
 
 @app.delete("/cli/accounts")
