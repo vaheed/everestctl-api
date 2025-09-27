@@ -8,6 +8,7 @@ from app import execs
 
 def test_bootstrap_job_flow(monkeypatch):
     client = TestClient(app)
+    admin_key = os.getenv("ADMIN_API_KEY", "changeme")
 
     def fake_run_cmd(_cmd, input_text=None, timeout=60, env=None):
         # succeed for any command
@@ -17,7 +18,7 @@ def test_bootstrap_job_flow(monkeypatch):
 
     r = client.post(
         "/bootstrap/users",
-        headers={"X-Admin-Key": os.getenv("ADMIN_API_KEY", "changeme"), "Content-Type": "application/json"},
+        headers={"X-Admin-Key": admin_key, "Content-Type": "application/json"},
         json={"username": "alice"},
     )
     assert r.status_code == 202
@@ -26,14 +27,14 @@ def test_bootstrap_job_flow(monkeypatch):
 
     # poll for completion
     for _ in range(50):
-        sr = client.get(f"/jobs/{job_id}", headers={"X-Admin-Key": "changeme"})
+        sr = client.get(f"/jobs/{job_id}", headers={"X-Admin-Key": admin_key})
         assert sr.status_code == 200
         status = sr.json()["status"]
         if status in ("succeeded", "failed"):
             break
         time.sleep(0.02)
 
-    rr = client.get(f"/jobs/{job_id}/result", headers={"X-Admin-Key": "changeme"})
+    rr = client.get(f"/jobs/{job_id}/result", headers={"X-Admin-Key": admin_key})
     assert rr.status_code == 200
     result = rr.json()
     assert result["overall_status"] in ("succeeded", "failed")
