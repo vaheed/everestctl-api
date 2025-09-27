@@ -10,7 +10,7 @@ from typing import Any, Dict, Optional
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 
-from .execs import run_cmd
+from . import execs
 from .jobs import job_store, run_bootstrap_job
 from .parsers import try_parse_json_or_table
 
@@ -113,7 +113,7 @@ async def get_job_result(job_id: str):
 @app.get("/accounts/list", dependencies=[Depends(require_admin_key)])
 async def accounts_list():
     # Intentionally using singular per instruction: `everestctl account list`
-    res = run_cmd(["everestctl", "account", "list"])  # type: ignore[arg-type]
+    res = execs.run_cmd(["everestctl", "account", "list"])  # type: ignore[arg-type]
     if res.exit_code != 0:
         # Provide stderr tail
         detail = res.stderr[-500:] if res.stderr else ""
@@ -121,4 +121,3 @@ async def accounts_list():
 
     parsed = try_parse_json_or_table(res.stdout)
     return parsed
-

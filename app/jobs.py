@@ -6,7 +6,7 @@ import uuid
 from dataclasses import dataclass, field, asdict
 from typing import Any, Dict, List, Optional
 
-from .execs import run_cmd, format_command
+from . import execs
 from .k8s import build_quota_and_limits_yaml
 from .rbac import build_policy_csv, apply_rbac_policy
 
@@ -102,10 +102,10 @@ async def run_bootstrap_job(job: Job) -> None:
 
         # Step 1: create account
         cmd1 = ["everestctl", "accounts", "create", "-u", username]
-        res1 = run_cmd(cmd1)
+        res1 = execs.run_cmd(cmd1)
         step1 = JobStep(
             name="create_account",
-            command=format_command(cmd1),
+            command=execs.format_command(cmd1),
             exit_code=res1.exit_code,
             stdout=res1.stdout,
             stderr=res1.stderr,
@@ -132,10 +132,10 @@ async def run_bootstrap_job(job: Job) -> None:
         ]
         if take_ownership:
             cmd2.append("--take-ownership")
-        res2 = run_cmd(cmd2)
+        res2 = execs.run_cmd(cmd2)
         step2 = JobStep(
             name="add_namespace",
-            command=format_command(cmd2),
+            command=execs.format_command(cmd2),
             exit_code=res2.exit_code,
             stdout=res2.stdout,
             stderr=res2.stderr,
@@ -153,10 +153,10 @@ async def run_bootstrap_job(job: Job) -> None:
         # Step 3: apply resource quota & limit range
         manifest = build_quota_and_limits_yaml(namespace, cpu_cores, ram_mb, disk_gb)
         cmd3 = ["kubectl", "apply", "-n", namespace, "-f", "-"]
-        res3 = run_cmd(cmd3, input_text=manifest)
+        res3 = execs.run_cmd(cmd3, input_text=manifest)
         step3 = JobStep(
             name="apply_resource_quota",
-            command=format_command(cmd3),
+            command=execs.format_command(cmd3),
             exit_code=res3.exit_code,
             stdout=res3.stdout,
             stderr=res3.stderr,
@@ -205,4 +205,3 @@ async def run_bootstrap_job(job: Job) -> None:
         job.status = "failed"
         job.summary = f"Unexpected error: {e}"
         await job_store.set(job)
-
