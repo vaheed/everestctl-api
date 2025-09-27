@@ -36,7 +36,7 @@ jobs:
             curl -sSsf http://127.0.0.1:18080/readyz && break || sleep 1; \
           done
           # Health check returns ok=true
-          curl -sSsf http://127.0.0.1:18080/healthz | grep '"ok": true'
+          curl -sSsf http://127.0.0.1:18080/healthz | grep -E '"ok"[[:space:]]*:[[:space:]]*true'
       - name: Cleanup container
         if: ${{ always() }}
         run: |
@@ -50,6 +50,8 @@ jobs:
     if: ${{ always() }}
     steps:
       - uses: actions/checkout@v4
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
       - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
