@@ -25,6 +25,20 @@ To provide `everestctl` inside the container, either:
 - Mount the binary at runtime (easiest with Compose): add `./everestctl:/usr/local/bin/everestctl` under `volumes`.
 - Or bake a custom image that copies your binary to `/usr/local/bin/everestctl`.
 
+## Production Image (GHCR)
+
+Pull the published image:
+
+```bash
+docker pull ghcr.io/vaheed/everestctl-api:latest
+```
+
+Or use the production compose file which references GHCR:
+
+```bash
+docker compose -f docker-compose.prod.yml up -d
+```
+
 ## Configuration (env vars)
 
 | Variable | Default | Description |
