@@ -26,6 +26,27 @@ app.middleware("http")(correlation_middleware)
 jobs = JobStore()
 
 
+def _mask_command(cmd_str: str) -> str:
+    """Mask password flags in a joined command string for safe logging."""
+    parts = cmd_str.split()
+    out = []
+    i = 0
+    while i < len(parts):
+        p = parts[i]
+        if p in ("-p", "--password") and i + 1 < len(parts):
+            out.append(p)
+            out.append("********")
+            i += 2
+            continue
+        if p.startswith("--password="):
+            out.append("--password=********")
+            i += 1
+            continue
+        out.append(p)
+        i += 1
+    return " ".join(out)
+
+
 async def require_admin_key(x_admin_key: Optional[str] = Header(None, alias="X-Admin-Key")) -> None:
     if not x_admin_key or x_admin_key != ADMIN_API_KEY:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
@@ -53,6 +74,9 @@ class BootstrapRequest(BaseModel):
     operators: OperatorFlags = Field(default_factory=OperatorFlags)
     take_ownership: bool = False
     resources: Resources = Field(default_factory=Resources)
+    # Optional initial password. If omitted, the API uses
+    # BOOTSTRAP_DEFAULT_PASSWORD env or generates a strong one.
+    password: Optional[str] = None
 
 
 class PasswordChangeRequest(BaseModel):
@@ -124,11 +148,33 @@ async def submit_bootstrap(req: BootstrapRequest, background: BackgroundTasks):
         overall_status = "succeeded"
         summary = []
 
+        # Track if we generated a password to return it in the result
+        generated_password = None
+
         try:
-            # Step 1: Create account
-            step1_cmd = ["everestctl", "accounts", "create", "-u", req.username]
+            # Step 1: Create account (supply password to avoid TTY prompts)
+            import secrets
+
+            default_pw_env = os.environ.get("BOOTSTRAP_DEFAULT_PASSWORD")
+            chosen_password = req.password or default_pw_env
+            if not chosen_password:
+                generated_password = secrets.token_urlsafe(16)
+                chosen_password = generated_password
+
+            step1_cmd = [
+                "everestctl",
+                "accounts",
+                "create",
+                "-u",
+                req.username,
+                "-p",
+                chosen_password,
+            ]
             res1 = await run_cmd(step1_cmd, timeout=60)
             res1.update({"name": "create_account"})
+            # Mask secrets in the logged command
+            if "command" in res1:
+                res1["command"] = _mask_command(res1["command"])  # type: ignore
             steps.append(res1)
             logger.info(
                 "step",
@@ -182,22 +228,22 @@ async def submit_bootstrap(req: BootstrapRequest, background: BackgroundTasks):
                     res2 = await run_cmd(old_cli_cmd, timeout=120)
                     res2.update({"name": "add_namespace"})
 
-            steps.append(res2)
-            logger.info(
-                "step",
-                extra={
-                    "event": "job_step",
-                    "job_id": job.job_id,
-                    "step_name": "add_namespace",
-                    "command": res2.get("command"),
-                    "exit_code": res2.get("exit_code"),
-                    "stdout": res2.get("stdout"),
-                    "stderr": res2.get("stderr"),
-                },
-            )
-            if res2.get("exit_code") != 0:
-                overall_status = "failed"
-                summary.append("namespace add failed")
+                steps.append(res2)
+                logger.info(
+                    "step",
+                    extra={
+                        "event": "job_step",
+                        "job_id": job.job_id,
+                        "step_name": "add_namespace",
+                        "command": res2.get("command"),
+                        "exit_code": res2.get("exit_code"),
+                        "stdout": res2.get("stdout"),
+                        "stderr": res2.get("stderr"),
+                    },
+                )
+                if res2.get("exit_code") != 0:
+                    overall_status = "failed"
+                    summary.append("namespace add failed")
 
             # Step 3: Apply ResourceQuota & LimitRange
             if overall_status == "succeeded":
@@ -264,17 +310,22 @@ async def submit_bootstrap(req: BootstrapRequest, background: BackgroundTasks):
             logger.exception("Bootstrap job failed")
             summary.append("internal error")
         finally:
+            # Build result payload and include generated credentials (if any)
+            result_payload = {
+                "inputs": inputs,
+                "steps": steps,
+                "overall_status": overall_status,
+                "summary": "; ".join(summary) if summary else overall_status,
+            }
+            if generated_password:
+                result_payload["credentials"] = {"username": req.username, "password": generated_password}
+
             await jobs.update(
                 job.job_id,
                 status=overall_status,
                 finished_at=utcnow_iso(),
                 summary="; ".join(summary) if summary else overall_status,
-                result={
-                    "inputs": inputs,
-                    "steps": steps,
-                    "overall_status": overall_status,
-                    "summary": "; ".join(summary) if summary else overall_status,
-                },
+                result=result_payload,
             )
             logger.info(
                 "job finished",
@@ -350,7 +401,21 @@ async def set_account_password(req: PasswordChangeRequest):
         req.username,
     ], timeout=60, input_text=input_text)
     if res.get("exit_code") != 0:
-        raise HTTPException(status_code=502, detail={"error": "set-password failed", "detail": res.get("stderr", "")[-4000:]})
+        # Fallback to flag-based non-interactive if stdin/TTY is not supported by this version
+        res2 = await run_cmd([
+            "everestctl",
+            "accounts",
+            "set-password",
+            "-u",
+            req.username,
+            "-p",
+            req.new_password,
+        ], timeout=60)
+        if "command" in res2:
+            res2["command"] = _mask_command(res2["command"])  # type: ignore
+        if res2.get("exit_code") != 0:
+            detail = (res2.get("stderr") or res.get("stderr") or "")[-4000:]
+            raise HTTPException(status_code=502, detail={"error": "set-password failed", "detail": detail})
     return {"ok": True, "username": req.username}
 
 

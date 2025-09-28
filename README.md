@@ -51,6 +51,7 @@ Notes
 - `ADMIN_API_KEY`: required header value for protected routes (default: changeme)
 - `KUBECONFIG`: path to kubeconfig inside the container (default: /root/.kube/config)
 - `EVEREST_RBAC_APPLY_CMD`: optional command template to apply RBAC, with `{file}` placeholder for a temp policy file
+- `BOOTSTRAP_DEFAULT_PASSWORD`: optional default password to use for newly created accounts when not provided in the request. If unset, the API generates a strong random password and returns it in the job result under `credentials`.
 
 ## Endpoints
 
@@ -255,3 +256,7 @@ What suspend/delete do
 Notes
 - RBAC revocation edits the `everest-rbac` ConfigMap in `everest-system` and removes lines for the specific user role/binding. This assumes you are using ConfigMap-based RBAC.
 - Suspend success is reported if at least one action (scale down or RBAC revoke) succeeds; account deactivation is best-effort since flags vary by version.
+Password during bootstrap
+- The API calls `everestctl accounts create` non‑interactively by supplying a password to avoid TTY prompts.
+- You can pass a password in the request body: `{ "username": "alice", "password": "S3cure!" }`.
+- If omitted, it uses `BOOTSTRAP_DEFAULT_PASSWORD` if set; otherwise it generates a strong password and returns it in the job result (`credentials`).
