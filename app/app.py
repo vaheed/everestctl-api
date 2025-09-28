@@ -611,26 +611,46 @@ async def suspend_user(req: SuspendUserRequest):
     ns = req.namespace or req.username
     steps = []
 
-    # Step 1: deactivate/disable/suspend account via everestctl (try variants)
-    deactivate_variants = [
-        ["everestctl", "accounts", "deactivate", "-u", req.username],
-        ["everestctl", "accounts", "disable", "-u", req.username],
-        ["everestctl", "accounts", "suspend", "-u", req.username],
-        ["everestctl", "accounts", "lock", "-u", req.username],
-    ]
+    # Step 1: deactivate/disable/suspend account via everestctl (probe support to avoid noise)
     acct_res = None
-    for variant in deactivate_variants:
-        r = await run_cmd(variant, timeout=60)
-        r.update({"name": "deactivate_account"})
-        steps.append(r)
-        if r.get("exit_code") == 0:
-            acct_res = r
-            break
+    try:
+        help_res = await run_cmd(["everestctl", "accounts", "--help"], timeout=10)
+        help_text = (help_res.get("stdout", "") + "\n" + help_res.get("stderr", "")).lower()
+    except Exception:
+        help_text = ""
+    supported = set()
+    for name in ("deactivate", "disable", "suspend", "lock"):
+        if f"\n  {name} " in help_text or f"accounts {name}" in help_text:
+            supported.add(name)
+    if supported:
+        variants = []
+        if "deactivate" in supported:
+            variants.append(["everestctl", "accounts", "deactivate", "-u", req.username])
+        if "disable" in supported:
+            variants.append(["everestctl", "accounts", "disable", "-u", req.username])
+        if "suspend" in supported:
+            variants.append(["everestctl", "accounts", "suspend", "-u", req.username])
+        if "lock" in supported:
+            variants.append(["everestctl", "accounts", "lock", "-u", req.username])
+        for variant in variants:
+            r = await run_cmd(variant, timeout=60)
+            r.update({"name": "deactivate_account"})
+            steps.append(r)
+            if r.get("exit_code") == 0:
+                acct_res = r
+                break
     # Step 2: scale down DB workloads
     scale_res = None
     if req.scale_statefulsets:
         scale_cmd = build_scale_statefulsets_cmd(ns)
         scale_res = await run_cmd(scale_cmd, timeout=90)
+        # Treat lack of resources as a no-op success for friendlier UX
+        if scale_res.get("exit_code") != 0:
+            errtxt = (scale_res.get("stderr", "") + scale_res.get("stdout", "")).lower()
+            if "no objects passed to scale" in errtxt or "no matches for kind \"statefulset\"" in errtxt:
+                scale_res["exit_code"] = 0
+                msg = "no StatefulSets to scale"
+                scale_res["stdout"] = (scale_res.get("stdout", "") + ("\n" if scale_res.get("stdout") else "") + msg).strip()
         scale_res.update({"name": "scale_down_statefulsets"})
         steps.append(scale_res)
     # Step 3: revoke RBAC
@@ -651,6 +671,11 @@ async def suspend_user(req: SuspendUserRequest):
 async def delete_user(req: DeleteUserRequest):
     ns = req.namespace or req.username
     steps = []
+    # Early log to aid debugging long-running deletions
+    logger.info(
+        "delete request",
+        extra={"event": "delete_request", "username": req.username, "namespace": ns},
+    )
 
     # Step 1: remove namespace (prefer everestctl, fallback to kubectl)
     rm_ns = await run_cmd(["everestctl", "namespaces", "remove", ns], timeout=180)
@@ -658,7 +683,18 @@ async def delete_user(req: DeleteUserRequest):
     steps.append(rm_ns)
     if rm_ns.get("exit_code") != 0:
         # fallback to kubectl delete namespace
-        k8s_del = await run_cmd(["kubectl", "delete", "namespace", ns, "--ignore-not-found=true"], timeout=180)
+        k8s_del = await run_cmd(
+            [
+                "kubectl",
+                "delete",
+                "namespace",
+                ns,
+                "--ignore-not-found=true",
+                "--wait=false",
+                "--timeout=30s",
+            ],
+            timeout=60,
+        )
         k8s_del.update({"name": "delete_namespace"})
         steps.append(k8s_del)
 

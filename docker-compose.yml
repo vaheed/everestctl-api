@@ -1,7 +1,8 @@
 version: "3.8"
 services:
   api:
-    build: .
+    image: ghcr.io/vaheed/everestctl-api:latest
+    pull_policy: always
     environment:
       - ADMIN_API_KEY=${ADMIN_API_KEY:-changeme}
       - PORT=8080
