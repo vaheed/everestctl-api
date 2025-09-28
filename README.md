@@ -128,7 +128,7 @@ Runtime port
 - In-memory job store: use Redis/Celery/RQ for persistence in production
 - Consider rate limiting and structured logging with correlation IDs
   - This API emits JSON logs with `request_id` for correlation
- - Dependencies are version-ranged for stability; pin exactly if desired
+- Dependencies are version-ranged for stability; pin exactly if desired
 
 ## Reference
 
@@ -250,6 +250,24 @@ curl -sS -X POST "$BASE_URL/accounts/delete" \
       }'
 # { "ok": true, "username": "alice", "namespace": "alice", "steps": [ ... ] }
 ```
+
+## Auth & Security
+
+- Single key header auth via `X-Admin-Key` (env: `ADMIN_API_KEY`).
+- Optional multi-key rotation: set `ADMIN_API_KEYS_JSON` to a JSON map like `{ "k1": "secret1", "k2": "secret2" }` and send both headers `X-Admin-Key-Id: k1` and `X-Admin-Key: secret1`.
+- Correlated JSON logs: send `X-Request-ID` to propagate your trace id; the API echoes it on responses.
+- Prometheus metrics at `/metrics` (enable by installing `prometheus-client`, already in requirements).
+
+## Operational Controls
+
+- `ENABLE_K8S_NAMESPACE_DELETE_FALLBACK`: when `true`, allow fallback `kubectl delete namespace` if `everestctl namespaces remove` fails. Default: disabled.
+- `ALLOWED_NAMESPACE_PREFIXES`: optional comma-separated list of allowed namespace prefixes (e.g. `user-,team-`). If set, incoming namespaces must start with one of these prefixes.
+- `MAX_SUBPROC_CONCURRENCY`: cap concurrent CLI calls (default: 16). `SAFE_SUBPROCESS_ENV=1` restricts environment passed to subprocesses to a minimal allowlist.
+
+## Metrics
+
+- Exposed at `GET /metrics` in Prometheus exposition format.
+- Includes CLI latency histogram `everest_api_cli_latency_seconds` and call counter `everest_api_cli_calls_total` (labels: tool, exit_code).
 
 Quick examples for alice15
 

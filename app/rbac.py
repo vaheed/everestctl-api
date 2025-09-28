@@ -1,5 +1,6 @@
 import os
 import json
+import shlex
 import tempfile
 from typing import Dict, Any
 
@@ -115,7 +116,8 @@ async def apply_policy_if_configured(username: str, namespace: str, timeout: int
                 temp_path = tf.name
 
             cmd_str = cmd_tpl.replace("{file}", temp_path)
-            cmd = cmd_str.split()
+            # Use shlex.split to preserve quoted arguments safely
+            cmd = shlex.split(cmd_str)
             res = await run_cmd(cmd, timeout=timeout)
             res.update({
                 "name": "apply_rbac_policy",

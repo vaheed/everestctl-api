@@ -1,0 +1,142 @@
+name: Secure CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+  security-events: write
+  packages: write
+
+jobs:
+  lint_test_scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install app deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Install dev tools
+        run: |
+          pip install ruff==0.6.5 black==24.8.0 isort==5.13.2 mypy==1.11.1 pip-audit==2.7.3 pytest-cov==5.0.0
+
+      - name: Ruff (lint)
+        run: ruff check .
+
+      - name: Black (check)
+        run: black --check .
+
+      - name: isort (check)
+        run: isort --check-only .
+
+      - name: mypy (type check)
+        run: mypy app
+
+      - name: Pytest with coverage
+        run: pytest -q --cov=app --cov-report=xml
+
+      - name: pip-audit
+        run: pip-audit -r requirements.txt --progress-spinner=off || true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Install Trivy
+        uses: aquasecurity/install-trivy-action@v0.22.0
+
+      - name: Build image (local)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          load: true
+          tags: everestctl-api:ci
+
+      - name: Trivy filesystem scan
+        run: trivy fs --exit-code 0 --security-checks vuln,config --format sarif --output trivy-fs.sarif .
+
+      - name: Trivy image scan
+        run: trivy image --exit-code 0 --security-checks vuln --format sarif --output trivy-image.sarif everestctl-api:ci
+
+      - name: Upload Trivy results
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-image.sarif
+
+  build_sign_publish:
+    needs: lint_test_scan
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # needed for keyless signing
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image meta
+        id: meta
+        run: |
+          REPO_OWNER=${{ github.repository_owner }}
+          REPO_NAME=${GITHUB_REPOSITORY#*/}
+          IMAGE="ghcr.io/${REPO_OWNER}/${REPO_NAME}"
+          SHORT_SHA=${GITHUB_SHA::7}
+          TAGS="${IMAGE}:sha-${SHORT_SHA}"
+          if [ "${GITHUB_REF_TYPE}" = "branch" ] && [ "${GITHUB_REF_NAME}" = "main" ]; then
+            TAGS="$TAGS,${IMAGE}:latest"
+          fi
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            TAGS="$TAGS,${IMAGE}:${GITHUB_REF_NAME}"
+          fi
+          echo "image=${IMAGE}" >> $GITHUB_OUTPUT
+          echo "tags=${TAGS}" >> $GITHUB_OUTPUT
+
+      - name: Build and push (multi-arch)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.meta.outputs.tags }}
+          provenance: true
+          sbom: true
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3.6.0
+
+      - name: Cosign sign image (keyless)
+        env:
+          COSIGN_EXPERIMENTAL: "true"
+        run: |
+          for TAG in $(echo "${{ steps.meta.outputs.tags }}" | tr ',' '\n'); do
+            cosign sign --yes "$TAG"
+          done
+
+      - name: Generate SBOM (Syft)
+        uses: anchore/sbom-action@v0.16.0
+        with:
+          image: ${{ steps.meta.outputs.image }}:sha-${{ github.sha }}
+          artifact-name: sbom.spdx.json
+
+      - name: Upload artifact SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom.spdx.json
+

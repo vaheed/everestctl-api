@@ -5,12 +5,12 @@ services:
     environment:
       - ADMIN_API_KEY=${ADMIN_API_KEY:-changeme}
       - PORT=8080
-      - KUBECONFIG=/root/.kube/config
-      - BOOTSTRAP_DEFAULT_PASSWORD=${BOOTSTRAP_DEFAULT_PASSWORD:-}
-      - BOOTSTRAP_DEFAULT_OPERATORS=${BOOTSTRAP_DEFAULT_OPERATORS:-postgresql}
+      - KUBECONFIG=/appuser/.kube/config
+      - BOOTSTRAP_DEFAULT_PASSWORD=${BOOTSTRAP_DEFAULT_PASSWORD:-changemepass}
+      - BOOTSTRAP_DEFAULT_OPERATORS=${BOOTSTRAP_DEFAULT_OPERATORS:-mysql}
       - EVEREST_RBAC_ENABLE_ON_BOOTSTRAP=${EVEREST_RBAC_ENABLE_ON_BOOTSTRAP:-true}
-      - EVEREST_DB_COUNT_RESOURCES=${EVEREST_DB_COUNT_RESOURCES:-}
+      - EVEREST_DB_COUNT_RESOURCES=${EVEREST_DB_COUNT_RESOURCES:-5}
     ports:
       - "8080:8080"
     volumes:
-      - ${HOME}/.kube/config:/root/.kube/config:ro
+      - ${HOME}/.kube/config:/appuser/.kube/config:ro

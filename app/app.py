@@ -1,11 +1,12 @@
 import asyncio
 import logging
 import os
+import re
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Response, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict, field_validator
 
 from .execs import run_cmd
 from .jobs import JobStore, utcnow_iso
@@ -18,7 +19,15 @@ from .logging_utils import configure_logging, correlation_middleware
 configure_logging()
 logger = logging.getLogger("everestctl_api")
 
+# API key(s)
 ADMIN_API_KEY = os.environ.get("ADMIN_API_KEY", "changeme")
+# Optional multi-key support: JSON map of {kid: key}
+import json as _json  # local alias to avoid name clash
+try:
+    _ADMIN_KEYS_JSON = os.environ.get("ADMIN_API_KEYS_JSON")
+    ADMIN_API_KEYS: Optional[Dict[str, str]] = _json.loads(_ADMIN_KEYS_JSON) if _ADMIN_KEYS_JSON else None
+except Exception:
+    ADMIN_API_KEYS = None
 
 app = FastAPI(title="Everest Bootstrap API", version="1.0.0")
 # Correlation/JSON access logs
@@ -64,12 +73,42 @@ def _preview_text(text: Optional[str], limit: int = 600) -> str:
     return f"...omitted {omitted} chars...\n{tail}"
 
 
-async def require_admin_key(x_admin_key: Optional[str] = Header(None, alias="X-Admin-Key")) -> None:
+async def require_admin_key(
+    x_admin_key: Optional[str] = Header(None, alias="X-Admin-Key"),
+    x_admin_kid: Optional[str] = Header(None, alias="X-Admin-Key-Id"),
+) -> None:
+    # Support single key (default) and optional multi-key with kid
+    if ADMIN_API_KEYS:
+        if not (x_admin_kid and x_admin_key):
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
+        expected = ADMIN_API_KEYS.get(x_admin_kid)
+        if not expected or x_admin_key != expected:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
+        return
+    # Fallback single key
     if not x_admin_key or x_admin_key != ADMIN_API_KEY:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
 
 
+_K8S_NAME_RE = re.compile(r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$")
+_NAMESPACE_DENYLIST = {"kube-system", "kube-public", "default", "everest-system", "kube-node-lease"}
+
+
+def _validate_k8s_name(value: str, field_name: str) -> str:
+    if not _K8S_NAME_RE.match(value):
+        raise ValueError(f"{field_name} must match RFC 1123 label (lowercase alphanumerics and -)")
+    if field_name == "namespace" and value in _NAMESPACE_DENYLIST:
+        raise ValueError("namespace is not allowed")
+    # Optional allowed prefixes
+    prefixes = [p.strip() for p in os.environ.get("ALLOWED_NAMESPACE_PREFIXES", "").split(",") if p.strip()]
+    if field_name == "namespace" and prefixes:
+        if not any(value.startswith(p) for p in prefixes):
+            raise ValueError("namespace prefix not allowed")
+    return value
+
+
 class OperatorFlags(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     mongodb: bool = False
     postgresql: bool = False
     xtradb_cluster: bool = False
@@ -77,17 +116,19 @@ class OperatorFlags(BaseModel):
 
 
 class Resources(BaseModel):
-    cpu_cores: int = 2
-    ram_mb: int = 2048
-    disk_gb: int = 20
+    model_config = ConfigDict(extra="forbid")
+    cpu_cores: int = Field(2, ge=1, le=128)
+    ram_mb: int = Field(2048, ge=128, le=1048576)
+    disk_gb: int = Field(20, ge=1, le=1048576)
     # Optional: set a hard cap on the number of database cluster CRs
     # via ResourceQuota count/<resource> (see EVEREST_DB_COUNT_RESOURCES)
-    max_databases: Optional[int] = None
+    max_databases: Optional[int] = Field(default=None, ge=0, le=10000)
 
 
 class BootstrapRequest(BaseModel):
-    username: str = Field(..., min_length=1)
-    namespace: Optional[str] = None
+    model_config = ConfigDict(extra="forbid")
+    username: str = Field(..., min_length=1, max_length=63)
+    namespace: Optional[str] = Field(default=None, min_length=1, max_length=63)
     operators: OperatorFlags = Field(default_factory=OperatorFlags)
     take_ownership: bool = False
     resources: Resources = Field(default_factory=Resources)
@@ -95,32 +136,88 @@ class BootstrapRequest(BaseModel):
     # BOOTSTRAP_DEFAULT_PASSWORD env or generates a strong one.
     password: Optional[str] = None
 
+    @field_validator("username")
+    @classmethod
+    def _val_user(cls, v: str) -> str:
+        return _validate_k8s_name(v, "username")
+
+    @field_validator("namespace")
+    @classmethod
+    def _val_ns(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        return _validate_k8s_name(v, "namespace")
+
 
 class PasswordChangeRequest(BaseModel):
-    username: str = Field(..., min_length=1)
-    new_password: str = Field(..., min_length=1)
+    model_config = ConfigDict(extra="forbid")
+    username: str = Field(..., min_length=1, max_length=63)
+    new_password: str = Field(..., min_length=1, max_length=256)
+
+    @field_validator("username")
+    @classmethod
+    def _val_user(cls, v: str) -> str:
+        return _validate_k8s_name(v, "username")
 
 
 class NamespaceResourceUpdate(BaseModel):
-    namespace: str = Field(..., min_length=1)
+    model_config = ConfigDict(extra="forbid")
+    namespace: str = Field(..., min_length=1, max_length=63)
     resources: Resources = Field(default_factory=Resources)
+
+    @field_validator("namespace")
+    @classmethod
+    def _val_ns(cls, v: str) -> str:
+        return _validate_k8s_name(v, "namespace")
 
 
 class NamespaceOperatorsUpdate(BaseModel):
-    namespace: str = Field(..., min_length=1)
+    model_config = ConfigDict(extra="forbid")
+    namespace: str = Field(..., min_length=1, max_length=63)
     operators: OperatorFlags = Field(default_factory=OperatorFlags)
+
+    @field_validator("namespace")
+    @classmethod
+    def _val_ns(cls, v: str) -> str:
+        return _validate_k8s_name(v, "namespace")
 
 
 class SuspendUserRequest(BaseModel):
-    username: str = Field(..., min_length=1)
-    namespace: Optional[str] = None
+    model_config = ConfigDict(extra="forbid")
+    username: str = Field(..., min_length=1, max_length=63)
+    namespace: Optional[str] = Field(default=None, min_length=1, max_length=63)
     scale_statefulsets: bool = True
     revoke_rbac: bool = True
 
+    @field_validator("username")
+    @classmethod
+    def _val_user(cls, v: str) -> str:
+        return _validate_k8s_name(v, "username")
+
+    @field_validator("namespace")
+    @classmethod
+    def _val_ns(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        return _validate_k8s_name(v, "namespace")
+
 
 class DeleteUserRequest(BaseModel):
-    username: str = Field(..., min_length=1)
-    namespace: Optional[str] = None
+    model_config = ConfigDict(extra="forbid")
+    username: str = Field(..., min_length=1, max_length=63)
+    namespace: Optional[str] = Field(default=None, min_length=1, max_length=63)
+
+    @field_validator("username")
+    @classmethod
+    def _val_user(cls, v: str) -> str:
+        return _validate_k8s_name(v, "username")
+
+    @field_validator("namespace")
+    @classmethod
+    def _val_ns(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        return _validate_k8s_name(v, "namespace")
 
 
 @app.get("/healthz")
@@ -559,7 +656,7 @@ async def delete_user(req: DeleteUserRequest):
     rm_ns = await run_cmd(["everestctl", "namespaces", "remove", ns], timeout=180)
     rm_ns.update({"name": "remove_namespace"})
     steps.append(rm_ns)
-    if rm_ns.get("exit_code") != 0:
+    if rm_ns.get("exit_code") != 0 and os.environ.get("ENABLE_K8S_NAMESPACE_DELETE_FALLBACK", "").lower() in ("1", "true", "yes", "on"):
         # fallback to kubectl delete namespace
         k8s_del = await run_cmd(["kubectl", "delete", "namespace", ns, "--ignore-not-found=true"], timeout=180)
         k8s_del.update({"name": "delete_namespace"})
@@ -591,3 +688,14 @@ async def delete_user(req: DeleteUserRequest):
         overall_ok = False
 
     return {"ok": overall_ok, "username": req.username, "namespace": ns, "steps": steps}
+
+
+@app.get("/metrics")
+async def metrics() -> Response:
+    """Prometheus metrics exposition."""
+    try:
+        from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
+    except Exception:
+        raise HTTPException(status_code=503, detail="prometheus_client not installed")
+    data = generate_latest()  # type: ignore
+    return Response(content=data, media_type=CONTENT_TYPE_LATEST)
