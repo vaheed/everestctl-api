@@ -1,8 +1,8 @@
-import os
 import json
+import os
 import shlex
 import tempfile
-from typing import Dict, Any, Optional
+from typing import Any, Dict, Optional
 
 from .execs import run_cmd
 
@@ -23,16 +23,30 @@ def build_policy_csv(username: str, namespace: str) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _ensure_admin_baseline(existing_policy: str) -> str:
-    """
-    Ensure the policy contains a functional admin baseline so enabling
-    ConfigMap-based RBAC doesn't lock out administrators.
+def _prune_user_policy(existing_policy: str, username: str) -> str:
+    """Remove any bindings or policies associated with the user."""
 
-    - Guarantees the group binding: g, admin, role:admin
-    - Adds permissive admin rules if none exist
-    """
-    lines = [ln for ln in existing_policy.splitlines() if ln is not None]
-    # Flags
+    user_role = f"role:{username}"
+    kept_lines = []
+    for raw_line in existing_policy.splitlines():
+        stripped = raw_line.strip()
+        if not stripped:
+            kept_lines.append(raw_line)
+            continue
+        if stripped.startswith(f"g, {username}, "):
+            continue
+        if stripped.startswith("p, ") and (
+            f", {user_role}," in stripped or stripped.startswith(f"p, {user_role},")
+        ):
+            continue
+        kept_lines.append(raw_line)
+    return "\n".join(kept_lines).rstrip("\n")
+
+
+def _ensure_admin_baseline(existing_policy: str) -> str:
+    """Ensure the policy contains a functional admin baseline."""
+
+    lines = existing_policy.splitlines()
     has_admin_group = any(ln.strip().startswith("g, admin, role:admin") for ln in lines)
     has_admin_policies = any(ln.strip().startswith("p, role:admin,") for ln in lines)
 
@@ -50,22 +64,18 @@ def _ensure_admin_baseline(existing_policy: str) -> str:
             "p, role:admin, backup-storages, *, */*",
             "p, role:admin, monitoring-instances, *, */*",
         ]
-        # Prepend to make intent explicit
         lines = admin_rules + lines
 
-    # Rejoin with trailing newline
-    out = "\n".join(lines)
-    if not out.endswith("\n"):
-        out += "\n"
-    return out
+    out = "\n".join(lines).rstrip("\n")
+    return out + "\n"
 
 
 def _render_configmap_manifest(enabled_val: str, policy_body: str) -> str:
     """Render the ConfigMap manifest for the RBAC policy."""
-    indented_policy = "".join(
-        "    " + ln + ("\n" if not ln.endswith("\n") else "")
-        for ln in policy_body.splitlines()
-    )
+    policy_lines = policy_body.splitlines()
+    indented_policy = "\n".join(f"    {line}" for line in policy_lines)
+    if indented_policy:
+        indented_policy += "\n"
     manifest = f"""
 apiVersion: v1
 kind: ConfigMap
@@ -78,6 +88,41 @@ data:
 {indented_policy}
 """.strip() + "\n"
     return manifest
+
+
+async def _load_rbac_configmap(timeout: int) -> tuple[Dict[str, Any], Optional[Dict[str, Any]], Optional[str]]:
+    """Fetch the everest-rbac ConfigMap and return its parsed body."""
+
+    res = await run_cmd(
+        [
+            "kubectl",
+            "-n",
+            "everest-system",
+            "get",
+            "configmap",
+            "everest-rbac",
+            "-o",
+            "json",
+        ],
+        timeout=timeout,
+    )
+
+    if res.get("exit_code") != 0:
+        return res, None, None
+
+    stdout = res.get("stdout", "")
+    if not stdout.strip():
+        return res, None, "empty ConfigMap payload"
+
+    try:
+        parsed = json.loads(stdout)
+    except json.JSONDecodeError as exc:  # pragma: no cover - defensive
+        return res, None, f"failed to parse ConfigMap JSON: {exc}"
+
+    if not isinstance(parsed, dict):  # pragma: no cover - defensive
+        return res, None, "unexpected ConfigMap payload type"
+
+    return res, parsed, None
 
 
 async def apply_policy_if_configured(username: str, namespace: str, timeout: int = 60) -> Dict[str, Any]:
@@ -153,52 +198,20 @@ async def apply_policy_if_configured(username: str, namespace: str, timeout: int
                     pass
 
     # Built-in fallback: manage ConfigMap directly with kubectl
-    get_res = await run_cmd(
-        [
-            "kubectl",
-            "-n",
-            "everest-system",
-            "get",
-            "configmap",
-            "everest-rbac",
-            "-o",
-            "json",
-        ],
-        timeout=timeout,
-    )
-    create_new = get_res.get("exit_code") != 0
+    get_res, configmap_obj, parse_error = await _load_rbac_configmap(timeout)
     enabled_val = "true" if enable_flag else "false"
     existing_policy = ""
-    if not create_new:
-        try:
-            obj = json.loads(get_res.get("stdout", "{}"))
-            data = obj.get("data", {})
-            existing_policy = data.get("policy.csv", "")
-            # Keep existing enabled unless we explicitly set it true
-            if not enable_flag:
-                enabled_val = data.get("enabled", "false")
-        except Exception:
-            # Treat as create-new if parse fails
-            create_new = True
 
-    # Build new policy by removing previous lines for this user and appending fresh ones
-    def _filtered(existing: str) -> str:
-        lines = [ln for ln in existing.splitlines()]
-        new_lines = []
-        user_role = f"role:{username}"
-        for ln in lines:
-            s = ln.strip()
-            if not s:
-                new_lines.append(ln)
-                continue
-            if s.startswith(f"g, {username}, "):
-                continue
-            if s.startswith("p, ") and (f", {user_role}," in s or s.startswith(f"p, {user_role},")):
-                continue
-            new_lines.append(ln)
-        return "\n".join(new_lines).rstrip("\n")
+    if configmap_obj:
+        data = configmap_obj.get("data", {})
+        existing_policy = data.get("policy.csv", "")
+        if not enable_flag:
+            enabled_val = data.get("enabled", "false")
+    elif parse_error:
+        # Treat parse errors as an empty baseline and recreate the manifest.
+        existing_policy = ""
 
-    merged = _filtered(existing_policy)
+    merged = _prune_user_policy(existing_policy, username)
     # Ensure newline separation if existing content remains
     if merged:
         merged = merged + "\n" + policy.rstrip("\n") + "\n"
@@ -232,55 +245,49 @@ async def revoke_user_in_rbac_configmap(username: str, timeout: int = 60) -> Dic
     This directly patches the ConfigMap in everest-system namespace.
     Returns a step-like dict with rbac_changed flag.
     """
-    get_res = await run_cmd([
-        "kubectl",
-        "-n",
-        "everest-system",
-        "get",
-        "configmap",
-        "everest-rbac",
-        "-o",
-        "json",
-    ], timeout=timeout)
-    step = {"name": "revoke_rbac_user", "command": get_res.get("command", ""), "exit_code": get_res.get("exit_code", 1)}
+    get_res, configmap_obj, parse_error = await _load_rbac_configmap(timeout)
+    step = {
+        "name": "revoke_rbac_user",
+        "command": get_res.get("command", ""),
+        "exit_code": get_res.get("exit_code", 1),
+    }
     if get_res.get("exit_code") != 0:
-        step.update({"rbac_changed": False, "stdout": get_res.get("stdout", ""), "stderr": get_res.get("stderr", "")})
+        step.update(
+            {
+                "rbac_changed": False,
+                "stdout": get_res.get("stdout", ""),
+                "stderr": get_res.get("stderr", ""),
+            }
+        )
         return step
 
-    try:
-        obj = json.loads(get_res.get("stdout", "{}"))
-        data = obj.get("data", {})
-        enabled_val = data.get("enabled", "true")
-        policy = data.get("policy.csv", "")
-        lines = [ln for ln in policy.splitlines()]
-        new_lines = []
-        user_role = f"role:{username}"
-        for ln in lines:
-            s = ln.strip()
-            if not s:
-                new_lines.append(ln)
-                continue
-            # Remove user binding and the role's policies
-            if s.startswith(f"g, {username}, "):
-                continue
-            if s.startswith("p, ") and (f", {user_role}," in s or s.startswith(f"p, {user_role},")):
-                continue
-            new_lines.append(ln)
-        if new_lines == lines:
-            # Nothing to change
-            return {
-                "name": "revoke_rbac_user",
-                "command": get_res.get("command", ""),
-                "exit_code": 0,
-                "rbac_changed": False,
-                "stdout": "no changes needed",
-                "stderr": "",
-            }
-        # Build YAML for apply
-        new_policy = "\n".join(new_lines) + ("\n" if new_lines and not new_lines[-1].endswith("\n") else "")
-        manifest = _render_configmap_manifest(enabled_val, new_policy)
-    except Exception as e:
-        return {"name": "revoke_rbac_user", "exit_code": 1, "rbac_changed": False, "stdout": "", "stderr": f"parse error: {e}"}
+    if parse_error or not isinstance(configmap_obj, dict):
+        error_msg = parse_error or "missing ConfigMap payload"
+        return {
+            "name": "revoke_rbac_user",
+            "exit_code": 1,
+            "rbac_changed": False,
+            "stdout": "",
+            "stderr": f"parse error: {error_msg}",
+        }
+
+    data = configmap_obj.get("data", {})
+    enabled_val = data.get("enabled", "true")
+    existing_policy = data.get("policy.csv", "")
+    pruned_policy = _prune_user_policy(existing_policy, username)
+
+    if pruned_policy == existing_policy.rstrip("\n"):
+        return {
+            "name": "revoke_rbac_user",
+            "command": get_res.get("command", ""),
+            "exit_code": 0,
+            "rbac_changed": False,
+            "stdout": "no changes needed",
+            "stderr": "",
+        }
+
+    new_policy = pruned_policy + "\n" if pruned_policy else ""
+    manifest = _render_configmap_manifest(enabled_val, new_policy)
 
     apply_res = await run_cmd([
         "kubectl",

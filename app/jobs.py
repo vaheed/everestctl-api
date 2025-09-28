@@ -2,7 +2,7 @@ import asyncio
 import uuid
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 
 def utcnow_iso() -> str:
