@@ -260,7 +260,6 @@ curl -sS -X POST "$BASE_URL/accounts/delete" \
 
 ## Operational Controls
 
-- `ENABLE_K8S_NAMESPACE_DELETE_FALLBACK`: when `true`, allow fallback `kubectl delete namespace` if `everestctl namespaces remove` fails. Default: disabled.
 - `ALLOWED_NAMESPACE_PREFIXES`: optional comma-separated list of allowed namespace prefixes (e.g. `user-,team-`). If set, incoming namespaces must start with one of these prefixes.
 - `MAX_SUBPROC_CONCURRENCY`: cap concurrent CLI calls (default: 16). `SAFE_SUBPROCESS_ENV=1` restricts environment passed to subprocesses to a minimal allowlist.
 

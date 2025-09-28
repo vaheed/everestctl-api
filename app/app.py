@@ -656,7 +656,7 @@ async def delete_user(req: DeleteUserRequest):
     rm_ns = await run_cmd(["everestctl", "namespaces", "remove", ns], timeout=180)
     rm_ns.update({"name": "remove_namespace"})
     steps.append(rm_ns)
-    if rm_ns.get("exit_code") != 0 and os.environ.get("ENABLE_K8S_NAMESPACE_DELETE_FALLBACK", "").lower() in ("1", "true", "yes", "on"):
+    if rm_ns.get("exit_code") != 0:
         # fallback to kubectl delete namespace
         k8s_del = await run_cmd(["kubectl", "delete", "namespace", ns, "--ignore-not-found=true"], timeout=180)
         k8s_del.update({"name": "delete_namespace"})
