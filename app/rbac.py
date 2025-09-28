@@ -60,6 +60,26 @@ def _ensure_admin_baseline(existing_policy: str) -> str:
     return out
 
 
+def _render_configmap_manifest(enabled_val: str, policy_body: str) -> str:
+    """Render the ConfigMap manifest for the RBAC policy."""
+    indented_policy = "".join(
+        "    " + ln + ("\n" if not ln.endswith("\n") else "")
+        for ln in policy_body.splitlines()
+    )
+    manifest = f"""
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: everest-rbac
+  namespace: everest-system
+data:
+  enabled: "{enabled_val}"
+  policy.csv: |-
+{indented_policy}
+""".strip() + "\n"
+    return manifest
+
+
 async def apply_policy_if_configured(username: str, namespace: str, timeout: int = 60) -> Dict[str, Any]:
     """
     Apply RBAC policy for the user/namespace during bootstrap.
@@ -188,18 +208,7 @@ async def apply_policy_if_configured(username: str, namespace: str, timeout: int
     # Ensure admin baseline policies exist
     merged = _ensure_admin_baseline(merged)
 
-    indented_policy = "".join([("    " + ln + ("\n" if not ln.endswith("\n") else "")) for ln in merged.splitlines()])
-    manifest = f"""
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: everest-rbac
-  namespace: everest-system
-data:
-  enabled: "{enabled_val}"
-  policy.csv: |-
-{indented_policy}
-""".strip() + "\n"
+    manifest = _render_configmap_manifest(enabled_val, merged)
 
     apply_res = await run_cmd([
         "kubectl",
@@ -269,18 +278,7 @@ async def revoke_user_in_rbac_configmap(username: str, timeout: int = 60) -> Dic
             }
         # Build YAML for apply
         new_policy = "\n".join(new_lines) + ("\n" if new_lines and not new_lines[-1].endswith("\n") else "")
-        indented_policy = "".join([("    " + ln + ("\n" if not ln.endswith("\n") else "")) for ln in new_policy.splitlines()])
-        manifest = f"""
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: everest-rbac
-  namespace: everest-system
-data:
-  enabled: "{enabled_val}"
-  policy.csv: |-
-{indented_policy}
-""".strip() + "\n"
+        manifest = _render_configmap_manifest(enabled_val, new_policy)
     except Exception as e:
         return {"name": "revoke_rbac_user", "exit_code": 1, "rbac_changed": False, "stdout": "", "stderr": f"parse error: {e}"}
 
