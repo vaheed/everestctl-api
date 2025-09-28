@@ -1,7 +1,7 @@
 version: "3.8"
 services:
   api:
-    image: ghcr.io/vaheed/everestctl-api:latest
+    image: ghcr.io/vaheed/everestctl-api:v0.1.5
     pull_policy: always
     environment:
       - ADMIN_API_KEY=${ADMIN_API_KEY:-changeme}
