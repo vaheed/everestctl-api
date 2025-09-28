@@ -3,7 +3,8 @@ import logging
 import os
 import re
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from dataclasses import dataclass, field
+from typing import Any, Awaitable, Callable, Dict, Optional
 
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Response, status
 from pydantic import BaseModel, Field, ConfigDict, field_validator
@@ -33,6 +34,16 @@ app = FastAPI(title="Everest Bootstrap API", version="1.0.0")
 # Correlation/JSON access logs
 app.middleware("http")(correlation_middleware)
 jobs = JobStore()
+
+
+@dataclass
+class StepOutcome:
+    """Helper structure encapsulating a bootstrap step outcome."""
+
+    result: Dict[str, Any]
+    succeeded: bool
+    failure_summary: Optional[str] = None
+    meta: Dict[str, Any] = field(default_factory=dict)
 
 
 def _mask_command(cmd_str: str) -> str:
@@ -221,6 +232,190 @@ class DeleteUserRequest(BaseModel):
         return _validate_k8s_name(v, "namespace")
 
 
+async def _create_account(req: BootstrapRequest) -> StepOutcome:
+    """Create an Everest account, handling idempotent outcomes."""
+
+    import secrets
+
+    default_pw_env = os.environ.get("BOOTSTRAP_DEFAULT_PASSWORD")
+    chosen_password = req.password or default_pw_env
+    generated_password: Optional[str] = None
+    if not chosen_password:
+        generated_password = secrets.token_urlsafe(16)
+        chosen_password = generated_password
+
+    cmd = [
+        "everestctl",
+        "accounts",
+        "create",
+        "-u",
+        req.username,
+        "-p",
+        chosen_password,
+    ]
+    res = await run_cmd(cmd, timeout=60)
+    res.update({"name": "create_account"})
+    if "command" in res:
+        res["command"] = _mask_command(res["command"])  # type: ignore[index]
+
+    succeeded = res.get("exit_code") == 0
+    account_existed = False
+    failure_summary: Optional[str] = None
+
+    meta = {
+        "generated_password": generated_password,
+        "account_existed": account_existed,
+    }
+
+    if not succeeded:
+        msg = (res.get("stderr", "") + res.get("stdout", "")).lower()
+        if "already exists" in msg or "user exists" in msg or "exists" in msg:
+            res["exit_code"] = 0
+            res["stdout"] = (
+                res.get("stdout", "")
+                + ("\n" if res.get("stdout") else "")
+                + "user already exists; treated as success"
+            ).strip()
+            res["stderr"] = ""
+            account_existed = True
+            succeeded = True
+            meta.update({
+                "account_existed": True,
+                "log_adjustment": {
+                    "step_name": "create_account",
+                    "note": "treated as success: already exists",
+                },
+            })
+        else:
+            failure_summary = "account creation failed"
+
+    return StepOutcome(
+        result=res,
+        succeeded=succeeded,
+        failure_summary=failure_summary,
+        meta=meta,
+    )
+
+
+async def _ensure_namespace(req: BootstrapRequest, namespace: str) -> StepOutcome:
+    """Ensure the target namespace exists with the correct operators enabled."""
+
+    operators = req.operators
+    def_ops = os.environ.get("BOOTSTRAP_DEFAULT_OPERATORS", "postgresql")
+    def_set = {s.strip().lower() for s in def_ops.split(",") if s.strip()}
+    enable_mongodb = bool(operators.mongodb)
+    enable_postgresql = bool(operators.postgresql)
+    want_mysql_like = (
+        (operators.mysql is True)
+        or operators.xtradb_cluster
+        or ("mysql" in def_set)
+        or ("xtradb_cluster" in def_set)
+        or ("xtradb-cluster" in def_set)
+    )
+    if not any([enable_mongodb, enable_postgresql, want_mysql_like]):
+        enable_postgresql = True
+
+    new_cli_cmd = [
+        "everestctl",
+        "namespaces",
+        "add",
+        namespace,
+        f"--operator.mongodb={'true' if enable_mongodb else 'false'}",
+        f"--operator.postgresql={'true' if enable_postgresql else 'false'}",
+    ]
+    new_cli_cmd.append(f"--operator.mysql={'true' if want_mysql_like else 'false'}")
+    if req.take_ownership:
+        new_cli_cmd.append("--take-ownership")
+
+    res = await run_cmd(new_cli_cmd, timeout=120)
+    res.update({"name": "add_namespace"})
+
+    if res.get("exit_code") != 0 and (
+        "unknown flag" in res.get("stderr", "").lower()
+        or "unknown flag" in res.get("stdout", "").lower()
+    ):
+        old_cli_cmd = [
+            "everestctl",
+            "namespaces",
+            "add",
+            namespace,
+            f"--operator.mongodb={'true' if enable_mongodb else 'false'}",
+            f"--operator.postgresql={'true' if enable_postgresql else 'false'}",
+            f"--operator.xtradb-cluster={'true' if want_mysql_like else 'false'}",
+        ]
+        if req.take_ownership:
+            old_cli_cmd.append("--take-ownership")
+        res = await run_cmd(old_cli_cmd, timeout=120)
+        res.update({"name": "add_namespace"})
+
+    succeeded = res.get("exit_code") == 0
+    namespace_existed = False
+    failure_summary: Optional[str] = None
+    meta = {"namespace_existed": namespace_existed}
+
+    if not succeeded:
+        msg = (res.get("stderr", "") + res.get("stdout", "")).lower()
+        if "already exists" in msg or "exists" in msg or "already present" in msg:
+            res["exit_code"] = 0
+            res["stdout"] = (
+                res.get("stdout", "")
+                + ("\n" if res.get("stdout") else "")
+                + f"namespace '{namespace}' already exists; treated as success"
+            ).strip()
+            res["stderr"] = ""
+            namespace_existed = True
+            succeeded = True
+            meta.update(
+                {
+                    "namespace_existed": True,
+                    "log_adjustment": {
+                        "step_name": "add_namespace",
+                        "note": "treated as success: already exists",
+                    },
+                }
+            )
+        else:
+            failure_summary = "namespace add failed"
+
+    return StepOutcome(
+        result=res,
+        succeeded=succeeded,
+        failure_summary=failure_summary,
+        meta=meta,
+    )
+
+
+async def _apply_resource_quota(namespace: str, resources: Dict[str, Any]) -> StepOutcome:
+    """Apply the ResourceQuota and LimitRange manifest for the namespace."""
+
+    manifest = build_quota_limitrange_yaml(namespace, resources)
+    res = await run_cmd(
+        [
+            "kubectl",
+            "apply",
+            "-n",
+            namespace,
+            "-f",
+            "-",
+        ],
+        input_text=manifest,
+        timeout=90,
+    )
+    res.update({"name": "apply_resource_quota", "manifest_preview": manifest})
+
+    succeeded = res.get("exit_code") == 0
+    failure_summary = None if succeeded else "quota/limits apply failed"
+
+    return StepOutcome(result=res, succeeded=succeeded, failure_summary=failure_summary)
+
+
+async def _apply_rbac_policy(username: str, namespace: str) -> StepOutcome:
+    """Apply RBAC policy if configured. Does not impact job success if it fails."""
+
+    res = await apply_policy_if_configured(username, namespace, timeout=90)
+    return StepOutcome(result=res, succeeded=True)
+
+
 @app.get("/healthz")
 async def healthz():
     return {"ok": True, "time": datetime.now(timezone.utc).isoformat()}
@@ -251,7 +446,7 @@ async def submit_bootstrap(req: BootstrapRequest, background: BackgroundTasks):
             "job started",
             extra={"event": "job_started", "job_id": job.job_id, "username": req.username, "namespace": ns},
         )
-        steps = []
+        steps: list[Dict[str, Any]] = []
         inputs = {
             "username": req.username,
             "namespace": ns,
@@ -271,199 +466,84 @@ async def submit_bootstrap(req: BootstrapRequest, background: BackgroundTasks):
         namespace_existed = False
 
         try:
-            # Step 1: Create account (supply password to avoid TTY prompts)
-            import secrets
+            async def _log_and_record(outcome: StepOutcome) -> None:
+                steps.append(outcome.result)
+                logger.info(
+                    "step",
+                    extra={
+                        "event": "job_step",
+                        "job_id": job.job_id,
+                        "step_name": outcome.result.get("name"),
+                        "command": outcome.result.get("command"),
+                        "exit_code": outcome.result.get("exit_code"),
+                        "stdout_preview": _preview_text(outcome.result.get("stdout")),
+                        "stderr_preview": _preview_text(outcome.result.get("stderr")),
+                    },
+                )
 
-            default_pw_env = os.environ.get("BOOTSTRAP_DEFAULT_PASSWORD")
-            chosen_password = req.password or default_pw_env
-            if not chosen_password:
-                generated_password = secrets.token_urlsafe(16)
-                chosen_password = generated_password
-
-            step1_cmd = [
-                "everestctl",
-                "accounts",
-                "create",
-                "-u",
-                req.username,
-                "-p",
-                chosen_password,
+            steps_plan: list[
+                tuple[
+                    str,
+                    Callable[[], Awaitable[StepOutcome]],
+                    Callable[[str], bool],
+                    bool,
+                ]
+            ] = [
+                (
+                    "create_account",
+                    lambda: _create_account(req),
+                    lambda status: True,
+                    True,
+                ),
+                (
+                    "add_namespace",
+                    lambda: _ensure_namespace(req, ns),
+                    lambda status: status == "succeeded",
+                    True,
+                ),
+                (
+                    "apply_resource_quota",
+                    lambda: _apply_resource_quota(ns, req.resources.model_dump()),
+                    lambda status: status == "succeeded",
+                    True,
+                ),
+                (
+                    "apply_rbac_policy",
+                    lambda: _apply_rbac_policy(req.username, ns),
+                    lambda status: True,
+                    False,
+                ),
             ]
-            res1 = await run_cmd(step1_cmd, timeout=60)
-            res1.update({"name": "create_account"})
-            # Mask secrets in the logged command
-            if "command" in res1:
-                res1["command"] = _mask_command(res1["command"])  # type: ignore
-            steps.append(res1)
-            logger.info(
-                "step",
-                extra={
-                    "event": "job_step",
-                    "job_id": job.job_id,
-                    "step_name": "create_account",
-                    "command": res1.get("command"),
-                    "exit_code": res1.get("exit_code"),
-                    "stdout_preview": _preview_text(res1.get("stdout")),
-                    "stderr_preview": _preview_text(res1.get("stderr")),
-                },
-            )
-            # account_existed default set above
-            if res1.get("exit_code") != 0:
-                # Idempotency: treat "already exists" as success
-                msg = (res1.get("stderr", "") + res1.get("stdout", "")).lower()
-                if "already exists" in msg or "user exists" in msg or "exists" in msg:
-                    res1["exit_code"] = 0
-                    account_existed = True
-                    # Make output less alarming in job result
-                    res1["stdout"] = (res1.get("stdout", "") + ("\n" if res1.get("stdout") else "") + "user already exists; treated as success").strip()
-                    res1["stderr"] = ""
+
+            for _step_name, step_factory, should_run, affects_status in steps_plan:
+                if not should_run(overall_status):
+                    continue
+                outcome: StepOutcome = await step_factory()
+                await _log_and_record(outcome)
+                adjustment = outcome.meta.get("log_adjustment")
+                if adjustment:
                     logger.info(
                         "step",
                         extra={
                             "event": "job_step_adjusted",
                             "job_id": job.job_id,
-                            "step_name": "create_account",
-                            "note": "treated as success: already exists",
+                            **adjustment,
                         },
                     )
-                else:
+                if (
+                    affects_status
+                    and not outcome.succeeded
+                    and overall_status == "succeeded"
+                ):
                     overall_status = "failed"
-                    summary.append("account creation failed")
+                    if outcome.failure_summary:
+                        summary.append(outcome.failure_summary)
+                account_existed = account_existed or outcome.meta.get("account_existed", False)
+                namespace_existed = namespace_existed or outcome.meta.get("namespace_existed", False)
+                if "generated_password" in outcome.meta and outcome.meta["generated_password"]:
+                    generated_password = outcome.meta["generated_password"]
 
-            # Step 2: Create or take ownership of namespace (attempt newer CLI first)
-            if overall_status == "succeeded":
-                operators = req.operators
-                # Determine effective operator selections. If none selected in the
-                # request, fall back to BOOTSTRAP_DEFAULT_OPERATORS env (default: postgresql)
-                def_ops = os.environ.get("BOOTSTRAP_DEFAULT_OPERATORS", "postgresql")
-                def_set = {s.strip().lower() for s in def_ops.split(",") if s.strip()}
-                enable_mongodb = bool(operators.mongodb)
-                enable_postgresql = bool(operators.postgresql)
-                # mysql flag may be None on older/newer CLI; we derive an intent
-                want_mysql_like = (
-                    (operators.mysql is True)
-                    or operators.xtradb_cluster
-                    or ("mysql" in def_set)
-                    or ("xtradb_cluster" in def_set)
-                    or ("xtradb-cluster" in def_set)
-                )
-                # If nothing selected, enable defaults
-                if not any([enable_mongodb, enable_postgresql, want_mysql_like]):
-                    enable_postgresql = True  # safe default
-                new_cli_cmd = [
-                    "everestctl",
-                    "namespaces",
-                    "add",
-                    ns,
-                    f"--operator.mongodb={'true' if enable_mongodb else 'false'}",
-                    f"--operator.postgresql={'true' if enable_postgresql else 'false'}",
-                ]
-                # Prefer new mysql flag; fallback to xtradb in case of unknown flag
-                new_cli_cmd.append(f"--operator.mysql={'true' if want_mysql_like else 'false'}")
-                if req.take_ownership:
-                    new_cli_cmd.append("--take-ownership")
-
-                res2 = await run_cmd(new_cli_cmd, timeout=120)
-                res2.update({"name": "add_namespace"})
-                # Fallback to older flag if unknown option
-                if res2.get("exit_code") != 0 and ("unknown flag" in res2.get("stderr", "").lower() or "unknown flag" in res2.get("stdout", "").lower()):
-                    old_cli_cmd = [
-                        "everestctl",
-                        "namespaces",
-                        "add",
-                        ns,
-                        f"--operator.mongodb={'true' if enable_mongodb else 'false'}",
-                        f"--operator.postgresql={'true' if enable_postgresql else 'false'}",
-                        f"--operator.xtradb-cluster={'true' if want_mysql_like else 'false'}",
-                    ]
-                    if req.take_ownership:
-                        old_cli_cmd.append("--take-ownership")
-                    res2 = await run_cmd(old_cli_cmd, timeout=120)
-                    res2.update({"name": "add_namespace"})
-
-                steps.append(res2)
-                logger.info(
-                    "step",
-                    extra={
-                        "event": "job_step",
-                        "job_id": job.job_id,
-                        "step_name": "add_namespace",
-                        "command": res2.get("command"),
-                        "exit_code": res2.get("exit_code"),
-                        "stdout_preview": _preview_text(res2.get("stdout")),
-                        "stderr_preview": _preview_text(res2.get("stderr")),
-                    },
-                )
-                # namespace_existed default set above
-                if res2.get("exit_code") != 0:
-                    # Idempotency: treat "already exists" equivalents as success
-                    msg2 = (res2.get("stderr", "") + res2.get("stdout", "")).lower()
-                    if "already exists" in msg2 or "exists" in msg2 or "already present" in msg2:
-                        res2["exit_code"] = 0
-                        namespace_existed = True
-                        # Clean up messaging for clarity in result
-                        res2["stdout"] = (res2.get("stdout", "") + ("\n" if res2.get("stdout") else "") + f"namespace '{ns}' already exists; treated as success").strip()
-                        res2["stderr"] = ""
-                        logger.info(
-                            "step",
-                            extra={
-                                "event": "job_step_adjusted",
-                                "job_id": job.job_id,
-                                "step_name": "add_namespace",
-                                "note": "treated as success: already exists",
-                            },
-                        )
-                    else:
-                        overall_status = "failed"
-                        summary.append("namespace add failed")
-
-            # Step 3: Apply ResourceQuota & LimitRange
-            if overall_status == "succeeded":
-                manifest = build_quota_limitrange_yaml(ns, req.resources.model_dump())
-                res3 = await run_cmd([
-                    "kubectl",
-                    "apply",
-                    "-n",
-                    ns,
-                    "-f",
-                    "-",
-                ], input_text=manifest, timeout=90)
-                res3.update({
-                    "name": "apply_resource_quota",
-                    "manifest_preview": manifest,
-                })
-                steps.append(res3)
-                logger.info(
-                    "step",
-                    extra={
-                        "event": "job_step",
-                        "job_id": job.job_id,
-                        "step_name": "apply_resource_quota",
-                        "command": res3.get("command"),
-                        "exit_code": res3.get("exit_code"),
-                        "stdout_preview": _preview_text(res3.get("stdout")),
-                        "stderr_preview": _preview_text(res3.get("stderr")),
-                    },
-                )
-                if res3.get("exit_code") != 0:
-                    overall_status = "failed"
-                    summary.append("quota/limits apply failed")
-
-            # Step 4: RBAC policy (if configured)
-            rbac_step = await apply_policy_if_configured(req.username, ns, timeout=90)
-            steps.append(rbac_step)
-            logger.info(
-                "step",
-                extra={
-                    "event": "job_step",
-                    "job_id": job.job_id,
-                    "step_name": "apply_rbac_policy",
-                    "command": rbac_step.get("command"),
-                    "exit_code": rbac_step.get("exit_code"),
-                    "stdout_preview": _preview_text(rbac_step.get("stdout")),
-                    "stderr_preview": _preview_text(rbac_step.get("stderr")),
-                },
-            )
+            rbac_step = steps[-1] if steps else {}
 
             # Summarize
             if overall_status == "succeeded":
