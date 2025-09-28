@@ -1,8 +1,8 @@
 import os
-from typing import Dict, List
+from typing import Any, Dict, List
 
 
-def build_quota_limitrange_yaml(namespace: str, resources: Dict[str, int]) -> str:
+def build_quota_limitrange_yaml(namespace: str, resources: Dict[str, Any]) -> str:
     """
     Build a combined YAML for ResourceQuota and LimitRange.
 

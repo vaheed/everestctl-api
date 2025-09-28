@@ -2,6 +2,9 @@ import json
 import re
 from typing import Any, Dict, List
 
+# Precompiled splitter for whitespace-separated tables (performance/readability)
+_WHITESPACE_SPLITTER = re.compile(r"\s{2,}")
+
 
 def parse_accounts_output(text: str) -> Dict[str, Any]:
     """
@@ -36,11 +39,12 @@ def parse_accounts_output(text: str) -> Dict[str, Any]:
         return {"data": rows}
 
     # Fallback: whitespace columns. Use multiple spaces as separator.
-    splitter = re.compile(r"\s{2,}")
-    headers = [h.strip().lower().replace(" ", "_") for h in splitter.split(lines[0]) if h.strip()]
+    headers = [
+        h.strip().lower().replace(" ", "_") for h in _WHITESPACE_SPLITTER.split(lines[0]) if h.strip()
+    ]
     rows: List[Dict[str, Any]] = []
     for ln in lines[1:]:
-        parts = [p.strip() for p in splitter.split(ln) if p.strip()]
+        parts = [p.strip() for p in _WHITESPACE_SPLITTER.split(ln) if p.strip()]
         if len(parts) != len(headers):
             # try single spaces split as last resort
             parts = ln.split()
@@ -48,4 +52,3 @@ def parse_accounts_output(text: str) -> Dict[str, Any]:
                 continue
         rows.append({headers[i]: parts[i] for i in range(len(headers))})
     return {"data": rows}
-
