@@ -251,6 +251,28 @@ curl -sS -X POST "$BASE_URL/accounts/delete" \
 # { "ok": true, "username": "alice", "namespace": "alice", "steps": [ ... ] }
 ```
 
+Quick examples for alice15
+
+```
+# Suspend alice15 (scale down namespace and revoke RBAC entries)
+curl -sS -X POST "$BASE_URL/accounts/suspend" \
+  -H "X-Admin-Key: $ADMIN_API_KEY" -H "Content-Type: application/json" \
+  -d '{
+        "username": "alice15",
+        "namespace": "alice15",
+        "scale_statefulsets": true,
+        "revoke_rbac": true
+      }'
+
+# Delete alice15 completely (namespace + account + RBAC cleanup)
+curl -sS -X POST "$BASE_URL/accounts/delete" \
+  -H "X-Admin-Key: $ADMIN_API_KEY" -H "Content-Type: application/json" \
+  -d '{
+        "username": "alice15",
+        "namespace": "alice15"
+      }'
+```
+
 What suspend/delete do
 - Suspend: tries to deactivate the account (if supported by your everestctl), scales down all StatefulSets in the namespace to 0, and removes the user’s role/bindings from the `everest-rbac` ConfigMap.
 - Delete: removes the namespace (prefers `everestctl namespaces remove`, falls back to `kubectl delete namespace`), revokes the user in RBAC, and deletes the account (tries `everestctl accounts delete|remove`).

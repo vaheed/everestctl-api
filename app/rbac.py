@@ -8,7 +8,7 @@ from .execs import run_cmd
 
 def build_policy_csv(username: str, namespace: str) -> str:
     lines = [
-        f"p, role:{username}, namespaces, read, {namespace}",
+        f"p, role:{username}, namespaces, *, {namespace}",
         # engines must be readable across all to enable DB creation
         f"p, role:{username}, database-engines, read, */*",
         f"p, role:{username}, database-clusters, *, {namespace}/*",
@@ -20,6 +20,43 @@ def build_policy_csv(username: str, namespace: str) -> str:
         f"g, {username}, role:{username}",
     ]
     return "\n".join(lines) + "\n"
+
+
+def _ensure_admin_baseline(existing_policy: str) -> str:
+    """
+    Ensure the policy contains a functional admin baseline so enabling
+    ConfigMap-based RBAC doesn't lock out administrators.
+
+    - Guarantees the group binding: g, admin, role:admin
+    - Adds permissive admin rules if none exist
+    """
+    lines = [ln for ln in existing_policy.splitlines() if ln is not None]
+    # Flags
+    has_admin_group = any(ln.strip().startswith("g, admin, role:admin") for ln in lines)
+    has_admin_policies = any(ln.strip().startswith("p, role:admin,") for ln in lines)
+
+    if not has_admin_group:
+        lines.insert(0, "g, admin, role:admin")
+
+    if not has_admin_policies:
+        admin_rules = [
+            "p, role:admin, namespaces, *, *",
+            "p, role:admin, database-engines, *, */*",
+            "p, role:admin, database-clusters, *, */*",
+            "p, role:admin, database-cluster-backups, *, */*",
+            "p, role:admin, database-cluster-restores, *, */*",
+            "p, role:admin, database-cluster-credentials, *, */*",
+            "p, role:admin, backup-storages, *, */*",
+            "p, role:admin, monitoring-instances, *, */*",
+        ]
+        # Prepend to make intent explicit
+        lines = admin_rules + lines
+
+    # Rejoin with trailing newline
+    out = "\n".join(lines)
+    if not out.endswith("\n"):
+        out += "\n"
+    return out
 
 
 async def apply_policy_if_configured(username: str, namespace: str, timeout: int = 60) -> Dict[str, Any]:
@@ -145,6 +182,9 @@ async def apply_policy_if_configured(username: str, namespace: str, timeout: int
         merged = merged + "\n" + policy.rstrip("\n") + "\n"
     else:
         merged = policy.rstrip("\n") + "\n"
+
+    # Ensure admin baseline policies exist
+    merged = _ensure_admin_baseline(merged)
 
     indented_policy = "".join([("    " + ln + ("\n" if not ln.endswith("\n") else "")) for ln in merged.splitlines()])
     manifest = f"""

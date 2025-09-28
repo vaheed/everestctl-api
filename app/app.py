@@ -47,6 +47,23 @@ def _mask_command(cmd_str: str) -> str:
     return " ".join(out)
 
 
+def _preview_text(text: Optional[str], limit: int = 600) -> str:
+    """Return a short, friendly preview for logs.
+    - Drops carriage returns to avoid spinner spam.
+    - Truncates to the last `limit` characters.
+    - If nothing meaningful, returns empty string.
+    """
+    if not text:
+        return ""
+    s = text.replace("\r", "")
+    s = s.strip()
+    if len(s) <= limit:
+        return s
+    tail = s[-limit:]
+    omitted = len(s) - limit
+    return f"...omitted {omitted} chars...\n{tail}"
+
+
 async def require_admin_key(x_admin_key: Optional[str] = Header(None, alias="X-Admin-Key")) -> None:
     if not x_admin_key or x_admin_key != ADMIN_API_KEY:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
@@ -184,8 +201,8 @@ async def submit_bootstrap(req: BootstrapRequest, background: BackgroundTasks):
                     "step_name": "create_account",
                     "command": res1.get("command"),
                     "exit_code": res1.get("exit_code"),
-                    "stdout": res1.get("stdout"),
-                    "stderr": res1.get("stderr"),
+                    "stdout_preview": _preview_text(res1.get("stdout")),
+                    "stderr_preview": _preview_text(res1.get("stderr")),
                 },
             )
             if res1.get("exit_code") != 0:
@@ -252,8 +269,8 @@ async def submit_bootstrap(req: BootstrapRequest, background: BackgroundTasks):
                         "step_name": "add_namespace",
                         "command": res2.get("command"),
                         "exit_code": res2.get("exit_code"),
-                        "stdout": res2.get("stdout"),
-                        "stderr": res2.get("stderr"),
+                        "stdout_preview": _preview_text(res2.get("stdout")),
+                        "stderr_preview": _preview_text(res2.get("stderr")),
                     },
                 )
                 if res2.get("exit_code") != 0:
@@ -284,8 +301,8 @@ async def submit_bootstrap(req: BootstrapRequest, background: BackgroundTasks):
                         "step_name": "apply_resource_quota",
                         "command": res3.get("command"),
                         "exit_code": res3.get("exit_code"),
-                        "stdout": res3.get("stdout"),
-                        "stderr": res3.get("stderr"),
+                        "stdout_preview": _preview_text(res3.get("stdout")),
+                        "stderr_preview": _preview_text(res3.get("stderr")),
                     },
                 )
                 if res3.get("exit_code") != 0:
@@ -303,8 +320,8 @@ async def submit_bootstrap(req: BootstrapRequest, background: BackgroundTasks):
                     "step_name": "apply_rbac_policy",
                     "command": rbac_step.get("command"),
                     "exit_code": rbac_step.get("exit_code"),
-                    "stdout": rbac_step.get("stdout"),
-                    "stderr": rbac_step.get("stderr"),
+                    "stdout_preview": _preview_text(rbac_step.get("stdout")),
+                    "stderr_preview": _preview_text(rbac_step.get("stderr")),
                 },
             )
 
