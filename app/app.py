@@ -206,6 +206,7 @@ class DeleteUserRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     username: str = Field(..., min_length=1, max_length=63)
     namespace: Optional[str] = Field(default=None, min_length=1, max_length=63)
+    delete_account: bool = True
 
     @field_validator("username")
     @classmethod
@@ -730,24 +731,25 @@ async def delete_user(req: DeleteUserRequest):
     rbac_res = await revoke_user_in_rbac_configmap(req.username, timeout=90)
     steps.append(rbac_res)
 
-    # Step 3: delete account (try delete/remove)
-    del_cmds = [
-        ["everestctl", "accounts", "delete", "-u", req.username],
-        ["everestctl", "accounts", "remove", "-u", req.username],
-    ]
+    # Step 3: delete account (optional)
     acct_del_res = None
-    for cmd in del_cmds:
-        r = await run_cmd(cmd, timeout=60)
-        r.update({"name": "delete_account"})
-        steps.append(r)
-        if r.get("exit_code") == 0:
-            acct_del_res = r
-            break
+    if req.delete_account:
+        del_cmds = [
+            ["everestctl", "accounts", "delete", "-u", req.username],
+            ["everestctl", "accounts", "remove", "-u", req.username],
+        ]
+        for cmd in del_cmds:
+            r = await run_cmd(cmd, timeout=60)
+            r.update({"name": "delete_account"})
+            steps.append(r)
+            if r.get("exit_code") == 0:
+                acct_del_res = r
+                break
 
     overall_ok = True
     # Consider operation ok if namespace removal via either method succeeded and account deletion succeeded
     ns_ok = any(s.get("name") in ("remove_namespace", "delete_namespace") and s.get("exit_code") == 0 for s in steps)
-    acct_ok = acct_del_res is not None and acct_del_res.get("exit_code") == 0
+    acct_ok = (not req.delete_account) or (acct_del_res is not None and acct_del_res.get("exit_code") == 0)
     if not ns_ok or not acct_ok:
         overall_ok = False
 
