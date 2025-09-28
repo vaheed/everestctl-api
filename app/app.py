@@ -46,6 +46,23 @@ class StepOutcome:
     meta: Dict[str, Any] = field(default_factory=dict)
 
 
+def _log_job_step(job_id: str, step: Dict[str, Any]) -> None:
+    """Emit a structured log line describing a job step outcome."""
+
+    logger.info(
+        "step",
+        extra={
+            "event": "job_step",
+            "job_id": job_id,
+            "step_name": step.get("name"),
+            "command": step.get("command"),
+            "exit_code": step.get("exit_code"),
+            "stdout_preview": _preview_text(step.get("stdout")),
+            "stderr_preview": _preview_text(step.get("stderr")),
+        },
+    )
+
+
 def _mask_command(cmd_str: str) -> str:
     """Mask password flags in a joined command string for safe logging."""
     parts = cmd_str.split()
@@ -648,248 +665,675 @@ async def accounts_list():
     raise HTTPException(status_code=502, detail={"error": "everestctl failed", "detail": detail[-4000:]})
 
 
-@app.post("/accounts/password", dependencies=[Depends(require_admin_key)])
-async def set_account_password(req: PasswordChangeRequest):
-    """
-    Change a user's password using everestctl. Many versions prompt for the
-    password on stdin; provide it twice (password + confirmation).
-    """
-    # Attempt non-interactive first if supported (unknown; keep stdin flow as primary)
-    input_text = f"{req.new_password}\n{req.new_password}\n"
-    res = await run_cmd([
-        "everestctl",
-        "accounts",
-        "set-password",
-        "-u",
-        req.username,
-    ], timeout=60, input_text=input_text)
-    if res.get("exit_code") != 0:
-        # Fallback to flag-based non-interactive if stdin/TTY is not supported by this version
-        res2 = await run_cmd([
-            "everestctl",
-            "accounts",
-            "set-password",
-            "-u",
-            req.username,
-            "-p",
-            req.new_password,
-        ], timeout=60)
-        if "command" in res2:
-            res2["command"] = _mask_command(res2["command"])  # type: ignore
-        if res2.get("exit_code") != 0:
-            detail = (res2.get("stderr") or res.get("stderr") or "")[-4000:]
-            raise HTTPException(status_code=502, detail={"error": "set-password failed", "detail": detail})
-    return {"ok": True, "username": req.username}
+async def _set_account_password_job(job_id: str, req: PasswordChangeRequest) -> None:
+    await jobs.update(job_id, status="running", started_at=utcnow_iso())
+    logger.info(
+        "job started",
+        extra={"event": "job_started", "job_id": job_id, "username": req.username},
+    )
+
+    steps: list[Dict[str, Any]] = []
+    inputs = {"username": req.username}
+    overall_status = "succeeded"
+    error_detail: Optional[str] = None
+
+    try:
+        input_text = f"{req.new_password}\n{req.new_password}\n"
+        primary = await run_cmd(
+            [
+                "everestctl",
+                "accounts",
+                "set-password",
+                "-u",
+                req.username,
+            ],
+            timeout=60,
+            input_text=input_text,
+        )
+        primary.update({"name": "set_password_stdin"})
+        steps.append(primary)
+        _log_job_step(job_id, primary)
+
+        if primary.get("exit_code") != 0:
+            fallback = await run_cmd(
+                [
+                    "everestctl",
+                    "accounts",
+                    "set-password",
+                    "-u",
+                    req.username,
+                    "-p",
+                    req.new_password,
+                ],
+                timeout=60,
+            )
+            if "command" in fallback:
+                fallback["command"] = _mask_command(fallback["command"])  # type: ignore[index]
+            fallback.update({"name": "set_password_flag"})
+            steps.append(fallback)
+            _log_job_step(job_id, fallback)
+
+            if fallback.get("exit_code") != 0:
+                overall_status = "failed"
+                detail = (fallback.get("stderr") or primary.get("stderr") or "")
+                error_detail = detail[-4000:] if detail else None
+        # Success path falls through
+    except Exception as exc:  # pragma: no cover - defensive
+        overall_status = "failed"
+        error_detail = str(exc)
+        step = {
+            "name": "internal_error",
+            "command": "<internal>",
+            "exit_code": 1,
+            "stdout": "",
+            "stderr": str(exc),
+        }
+        steps.append(step)
+        _log_job_step(job_id, step)
+        logger.exception("Password job failed", extra={"event": "job_failed", "job_id": job_id})
+    finally:
+        summary_text = (
+            f"Password updated for {req.username}"
+            if overall_status == "succeeded"
+            else f"Failed to update password for {req.username}"
+        )
+        result_payload: Dict[str, Any] = {
+            "ok": overall_status == "succeeded",
+            "username": req.username,
+            "inputs": inputs,
+            "steps": steps,
+            "overall_status": overall_status,
+            "summary": summary_text,
+        }
+        if error_detail:
+            result_payload["error_detail"] = error_detail
+
+        await jobs.update(
+            job_id,
+            status=overall_status,
+            finished_at=utcnow_iso(),
+            summary=summary_text,
+            result=result_payload,
+        )
+        logger.info(
+            "job finished",
+            extra={
+                "event": "job_finished",
+                "job_id": job_id,
+                "status": overall_status,
+                "summary": summary_text,
+            },
+        )
 
 
-@app.post("/namespaces/resources", dependencies=[Depends(require_admin_key)])
-async def update_namespace_resources(req: NamespaceResourceUpdate):
-    """
-    Apply or update ResourceQuota and LimitRange for a namespace.
-    """
-    manifest = build_quota_limitrange_yaml(req.namespace, req.resources.model_dump())
-    res = await run_cmd([
-        "kubectl",
-        "apply",
-        "-n",
-        req.namespace,
-        "-f",
-        "-",
-    ], input_text=manifest, timeout=90)
-    if res.get("exit_code") != 0:
-        raise HTTPException(status_code=502, detail={"error": "kubectl apply failed", "detail": res.get("stderr", "")[-4000:]})
-    return {"ok": True, "namespace": req.namespace, "applied": True}
+async def _update_namespace_resources_job(job_id: str, req: NamespaceResourceUpdate) -> None:
+    await jobs.update(job_id, status="running", started_at=utcnow_iso())
+    logger.info(
+        "job started",
+        extra={"event": "job_started", "job_id": job_id, "namespace": req.namespace},
+    )
+
+    steps: list[Dict[str, Any]] = []
+    overall_status = "succeeded"
+    outcome_summary = f"Resource quota applied for namespace {req.namespace}"
+    inputs = {
+        "namespace": req.namespace,
+        "resources": req.resources.model_dump(),
+    }
+
+    try:
+        outcome = await _apply_resource_quota(req.namespace, req.resources.model_dump())
+        steps.append(outcome.result)
+        _log_job_step(job_id, outcome.result)
+        if not outcome.succeeded:
+            overall_status = "failed"
+            outcome_summary = outcome.failure_summary or "Resource quota apply failed"
+    except Exception as exc:  # pragma: no cover - defensive
+        overall_status = "failed"
+        outcome_summary = "Resource quota apply failed"
+        step = {
+            "name": "internal_error",
+            "command": "<internal>",
+            "exit_code": 1,
+            "stdout": "",
+            "stderr": str(exc),
+        }
+        steps.append(step)
+        _log_job_step(job_id, step)
+        logger.exception(
+            "Namespace resources job failed",
+            extra={"event": "job_failed", "job_id": job_id},
+        )
+    finally:
+        result_payload = {
+            "ok": overall_status == "succeeded",
+            "namespace": req.namespace,
+            "applied": overall_status == "succeeded",
+            "inputs": inputs,
+            "steps": steps,
+            "overall_status": overall_status,
+            "summary": outcome_summary,
+        }
+        await jobs.update(
+            job_id,
+            status=overall_status,
+            finished_at=utcnow_iso(),
+            summary=outcome_summary,
+            result=result_payload,
+        )
+        logger.info(
+            "job finished",
+            extra={
+                "event": "job_finished",
+                "job_id": job_id,
+                "status": overall_status,
+                "summary": outcome_summary,
+            },
+        )
 
 
-@app.post("/namespaces/operators", dependencies=[Depends(require_admin_key)])
-async def update_namespace_operators(req: NamespaceOperatorsUpdate):
-    """
-    Enable database operators for a namespace using everestctl. Supports both
-    new (--operator.mysql) and older (--operator.xtradb-cluster) flags.
-
-    Retries transient conflicts up to 3 times with 20s backoff when another
-    operation is in progress before returning 409.
-    """
+async def _update_namespace_operators_once(
+    req: NamespaceOperatorsUpdate,
+) -> StepOutcome:
     ops = req.operators
+    new_cli_cmd = [
+        "everestctl",
+        "namespaces",
+        "update",
+        req.namespace,
+        f"--operator.mongodb={'true' if ops.mongodb else 'false'}",
+        f"--operator.postgresql={'true' if ops.postgresql else 'false'}",
+    ]
+    if ops.mysql is not None:
+        new_cli_cmd.append(f"--operator.mysql={'true' if ops.mysql else 'false'}")
+    else:
+        new_cli_cmd.append("--operator.mysql=false")
+    res = await run_cmd(new_cli_cmd, timeout=120)
 
-    async def _attempt_once() -> Dict[str, Any]:
-        new_cli_cmd = [
+    used_legacy_cli = False
+    if res.get("exit_code") != 0 and (
+        "unknown flag" in res.get("stderr", "").lower()
+        or "unknown flag" in res.get("stdout", "").lower()
+    ):
+        old_cli_cmd = [
             "everestctl",
             "namespaces",
             "update",
             req.namespace,
             f"--operator.mongodb={'true' if ops.mongodb else 'false'}",
             f"--operator.postgresql={'true' if ops.postgresql else 'false'}",
+            f"--operator.xtradb-cluster={'true' if ops.xtradb_cluster else 'false'}",
         ]
-        if ops.mysql is not None:
-            new_cli_cmd.append(f"--operator.mysql={'true' if ops.mysql else 'false'}")
-        else:
-            new_cli_cmd.append("--operator.mysql=false")
-        r = await run_cmd(new_cli_cmd, timeout=120)
+        res = await run_cmd(old_cli_cmd, timeout=120)
+        used_legacy_cli = True
 
-        # Fallback to older CLI flag if mysql is unknown
-        if r.get("exit_code") != 0 and (
-            "unknown flag" in r.get("stderr", "").lower() or "unknown flag" in r.get("stdout", "").lower()
-        ):
-            old_cli_cmd = [
-                "everestctl",
-                "namespaces",
-                "update",
-                req.namespace,
-                f"--operator.mongodb={'true' if ops.mongodb else 'false'}",
-                f"--operator.postgresql={'true' if ops.postgresql else 'false'}",
-                f"--operator.xtradb-cluster={'true' if ops.xtradb_cluster else 'false'}",
-            ]
-            r = await run_cmd(old_cli_cmd, timeout=120)
-        return r
+    res.update({"name": "update_namespace_operators"})
+    succeeded = res.get("exit_code") == 0
+    failure_summary: Optional[str] = None
+    meta: Dict[str, Any] = {"used_legacy_cli": used_legacy_cli}
 
-    # Retry up to 3 times on transient "operation in progress" error
-    max_attempts = 3
-    backoff_seconds = 20
-    attempt = 0
-    while True:
-        attempt += 1
-        res = await _attempt_once()
-        if res.get("exit_code") == 0:
-            return {"ok": True, "namespace": req.namespace}
-
-        # Inspect message for known transient conflicts
+    if not succeeded:
         msg = (res.get("stderr", "") + "\n" + res.get("stdout", "")).strip()
-        low = msg.lower()
-        if "another operation" in low and "in progress" in low:
-            if attempt < max_attempts:
-                await asyncio.sleep(backoff_seconds)
-                continue
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "error": "operation in progress",
-                    "detail": msg[-4000:],
-                    "hint": "Another install/upgrade/rollback is running. Retry once it finishes.",
-                },
-                headers={"Retry-After": str(backoff_seconds)},
-            )
-        # Non-transient error
-        raise HTTPException(status_code=502, detail={"error": "namespaces update failed", "detail": msg[-4000:]})
+        lowered = msg.lower()
+        if "another operation" in lowered and "in progress" in lowered:
+            meta["transient_conflict"] = True
+            failure_summary = "Another operation is in progress"
+        else:
+            failure_summary = "Namespace operators update failed"
+        if msg:
+            meta["failure_message"] = msg[-4000:]
+
+    return StepOutcome(result=res, succeeded=succeeded, failure_summary=failure_summary, meta=meta)
 
 
-@app.post("/accounts/suspend", dependencies=[Depends(require_admin_key)])
-async def suspend_user(req: SuspendUserRequest):
-    ns = req.namespace or req.username
-    steps = []
-
-    # Step 1: deactivate/disable/suspend account via everestctl (probe support to avoid noise)
-    try:
-        help_res = await run_cmd(["everestctl", "accounts", "--help"], timeout=10)
-        help_text = (help_res.get("stdout", "") + "\n" + help_res.get("stderr", "")).lower()
-    except Exception:
-        help_text = ""
-    supported = set()
-    for name in ("deactivate", "disable", "suspend", "lock"):
-        if f"\n  {name} " in help_text or f"accounts {name}" in help_text:
-            supported.add(name)
-    if supported:
-        variants = []
-        if "deactivate" in supported:
-            variants.append(["everestctl", "accounts", "deactivate", "-u", req.username])
-        if "disable" in supported:
-            variants.append(["everestctl", "accounts", "disable", "-u", req.username])
-        if "suspend" in supported:
-            variants.append(["everestctl", "accounts", "suspend", "-u", req.username])
-        if "lock" in supported:
-            variants.append(["everestctl", "accounts", "lock", "-u", req.username])
-        for variant in variants:
-            r = await run_cmd(variant, timeout=60)
-            r.update({"name": "deactivate_account"})
-            steps.append(r)
-            if r.get("exit_code") == 0:
-                break
-    # Step 2: scale down DB workloads
-    scale_res = None
-    if req.scale_statefulsets:
-        scale_cmd = build_scale_statefulsets_cmd(ns)
-        scale_res = await run_cmd(scale_cmd, timeout=90)
-        # Treat lack of resources as a no-op success for friendlier UX
-        if scale_res.get("exit_code") != 0:
-            errtxt = (scale_res.get("stderr", "") + scale_res.get("stdout", "")).lower()
-            if "no objects passed to scale" in errtxt or "no matches for kind \"statefulset\"" in errtxt:
-                scale_res["exit_code"] = 0
-                msg = "no StatefulSets to scale"
-                scale_res["stdout"] = (scale_res.get("stdout", "") + ("\n" if scale_res.get("stdout") else "") + msg).strip()
-        scale_res.update({"name": "scale_down_statefulsets"})
-        steps.append(scale_res)
-    # Step 3: revoke RBAC
-    rbac_res = None
-    if req.revoke_rbac:
-        rbac_res = await revoke_user_in_rbac_configmap(req.username, timeout=90)
-        steps.append(rbac_res)
-
-    # Consider suspend successful if at least one remediation succeeded
-    scale_ok = (not req.scale_statefulsets) or (scale_res is not None and scale_res.get("exit_code") == 0)
-    rbac_ok = (not req.revoke_rbac) or (rbac_res is not None and rbac_res.get("exit_code") == 0)
-    overall_ok = bool(scale_ok or rbac_ok)
-
-    return {"ok": overall_ok, "username": req.username, "namespace": ns, "steps": steps}
-
-
-@app.post("/accounts/delete", dependencies=[Depends(require_admin_key)])
-async def delete_user(req: DeleteUserRequest):
-    ns = req.namespace or req.username
-    steps = []
-    # Early log to aid debugging long-running deletions
+async def _update_namespace_operators_job(job_id: str, req: NamespaceOperatorsUpdate) -> None:
+    await jobs.update(job_id, status="running", started_at=utcnow_iso())
     logger.info(
-        "delete request",
-        extra={"event": "delete_request", "username": req.username, "namespace": ns},
+        "job started",
+        extra={"event": "job_started", "job_id": job_id, "namespace": req.namespace},
     )
 
-    # Step 1: remove namespace (prefer everestctl, fallback to kubectl)
-    rm_ns = await run_cmd(["everestctl", "namespaces", "remove", ns], timeout=180)
-    rm_ns.update({"name": "remove_namespace"})
-    steps.append(rm_ns)
-    if rm_ns.get("exit_code") != 0:
-        # fallback to kubectl delete namespace
-        k8s_del = await run_cmd(
-            [
-                "kubectl",
-                "delete",
-                "namespace",
-                ns,
-                "--ignore-not-found=true",
-                "--wait=false",
-                "--timeout=30s",
-            ],
-            timeout=60,
-        )
-        k8s_del.update({"name": "delete_namespace"})
-        steps.append(k8s_del)
+    steps: list[Dict[str, Any]] = []
+    overall_status = "succeeded"
+    summary_text = f"Operators updated for namespace {req.namespace}"
+    conflict_backoff = 20
+    max_attempts = 3
+    attempt = 0
+    last_failure_message: Optional[str] = None
 
-    # Step 2: revoke RBAC entries
-    rbac_res = await revoke_user_in_rbac_configmap(req.username, timeout=90)
-    steps.append(rbac_res)
+    try:
+        while attempt < max_attempts:
+            attempt += 1
+            outcome = await _update_namespace_operators_once(req)
+            outcome.result["attempt"] = attempt
+            steps.append(outcome.result)
+            _log_job_step(job_id, outcome.result)
 
-    # Step 3: delete account (optional)
-    acct_del_res = None
-    if req.delete_account:
-        del_cmds = [
-            ["everestctl", "accounts", "delete", "-u", req.username],
-            ["everestctl", "accounts", "remove", "-u", req.username],
-        ]
-        for cmd in del_cmds:
-            r = await run_cmd(cmd, timeout=60)
-            r.update({"name": "delete_account"})
-            steps.append(r)
-            if r.get("exit_code") == 0:
-                acct_del_res = r
+            if outcome.succeeded:
                 break
 
-    overall_ok = True
-    # Consider operation ok if namespace removal via either method succeeded and account deletion succeeded
-    ns_ok = any(s.get("name") in ("remove_namespace", "delete_namespace") and s.get("exit_code") == 0 for s in steps)
-    acct_ok = (not req.delete_account) or (acct_del_res is not None and acct_del_res.get("exit_code") == 0)
-    if not ns_ok or not acct_ok:
-        overall_ok = False
+            if outcome.meta.get("transient_conflict"):
+                last_failure_message = outcome.meta.get("failure_message")
+                if attempt < max_attempts:
+                    await asyncio.sleep(conflict_backoff)
+                    continue
+                overall_status = "failed"
+                summary_text = (
+                    outcome.failure_summary
+                    or f"Another operation in progress for namespace {req.namespace}"
+                )
+                break
 
-    return {"ok": overall_ok, "username": req.username, "namespace": ns, "steps": steps}
+            overall_status = "failed"
+            summary_text = outcome.failure_summary or summary_text
+            last_failure_message = outcome.meta.get("failure_message")
+            break
+        else:
+            overall_status = "failed"
+            summary_text = (
+                "Unable to update operators"
+            )
+    except Exception as exc:  # pragma: no cover - defensive
+        overall_status = "failed"
+        summary_text = "Namespace operators update failed"
+        step = {
+            "name": "internal_error",
+            "command": "<internal>",
+            "exit_code": 1,
+            "stdout": "",
+            "stderr": str(exc),
+        }
+        steps.append(step)
+        _log_job_step(job_id, step)
+        logger.exception(
+            "Namespace operators job failed",
+            extra={"event": "job_failed", "job_id": job_id},
+        )
+    finally:
+        result_payload: Dict[str, Any] = {
+            "ok": overall_status == "succeeded",
+            "namespace": req.namespace,
+            "inputs": {
+                "namespace": req.namespace,
+                "operators": req.operators.model_dump(),
+            },
+            "steps": steps,
+            "overall_status": overall_status,
+            "summary": summary_text,
+            "attempts": attempt,
+        }
+        if last_failure_message:
+            result_payload["error_detail"] = last_failure_message
+
+        await jobs.update(
+            job_id,
+            status=overall_status,
+            finished_at=utcnow_iso(),
+            summary=summary_text,
+            result=result_payload,
+        )
+        logger.info(
+            "job finished",
+            extra={
+                "event": "job_finished",
+                "job_id": job_id,
+                "status": overall_status,
+                "summary": summary_text,
+            },
+        )
+
+
+async def _suspend_user_job(job_id: str, req: SuspendUserRequest) -> None:
+    ns = req.namespace or req.username
+    await jobs.update(job_id, status="running", started_at=utcnow_iso())
+    logger.info(
+        "job started",
+        extra={"event": "job_started", "job_id": job_id, "username": req.username, "namespace": ns},
+    )
+
+    steps: list[Dict[str, Any]] = []
+    overall_status = "succeeded"
+    summary_bits: list[str] = []
+    scale_success = False
+    rbac_success = False
+
+    try:
+        help_step: Dict[str, Any]
+        try:
+            help_res = await run_cmd(["everestctl", "accounts", "--help"], timeout=10)
+            help_text = (help_res.get("stdout", "") + "\n" + help_res.get("stderr", "")).lower()
+            help_step = {**help_res, "name": "accounts_help"}
+        except Exception as exc:  # pragma: no cover - defensive
+            help_text = ""
+            help_step = {
+                "name": "accounts_help",
+                "command": "everestctl accounts --help",
+                "exit_code": 1,
+                "stdout": "",
+                "stderr": str(exc),
+            }
+        steps.append(help_step)
+        _log_job_step(job_id, help_step)
+
+        supported = set()
+        for name in ("deactivate", "disable", "suspend", "lock"):
+            if f"\n  {name} " in help_text or f"accounts {name}" in help_text:
+                supported.add(name)
+        if supported:
+            variants = []
+            if "deactivate" in supported:
+                variants.append(["everestctl", "accounts", "deactivate", "-u", req.username])
+            if "disable" in supported:
+                variants.append(["everestctl", "accounts", "disable", "-u", req.username])
+            if "suspend" in supported:
+                variants.append(["everestctl", "accounts", "suspend", "-u", req.username])
+            if "lock" in supported:
+                variants.append(["everestctl", "accounts", "lock", "-u", req.username])
+            for variant in variants:
+                res = await run_cmd(variant, timeout=60)
+                res.update({"name": "deactivate_account", "variant": variant[2]})
+                steps.append(res)
+                _log_job_step(job_id, res)
+                if res.get("exit_code") == 0:
+                    summary_bits.append("account deactivated")
+                    break
+
+        if req.scale_statefulsets:
+            scale_cmd = build_scale_statefulsets_cmd(ns)
+            scale_res = await run_cmd(scale_cmd, timeout=90)
+            if scale_res.get("exit_code") != 0:
+                errtxt = (scale_res.get("stderr", "") + scale_res.get("stdout", "")).lower()
+                if "no objects passed to scale" in errtxt or "no matches for kind \"statefulset\"" in errtxt:
+                    scale_res["exit_code"] = 0
+                    msg = "no StatefulSets to scale"
+                    scale_res["stdout"] = (
+                        scale_res.get("stdout", "")
+                        + ("\n" if scale_res.get("stdout") else "")
+                        + msg
+                    ).strip()
+            scale_res.update({"name": "scale_down_statefulsets"})
+            steps.append(scale_res)
+            _log_job_step(job_id, scale_res)
+            scale_success = scale_res.get("exit_code") == 0
+            if scale_success:
+                summary_bits.append("workloads scaled down")
+        else:
+            scale_success = True
+
+        if req.revoke_rbac:
+            rbac_res = await revoke_user_in_rbac_configmap(req.username, timeout=90)
+            steps.append(rbac_res)
+            _log_job_step(job_id, rbac_res)
+            rbac_success = rbac_res.get("exit_code") == 0
+            if rbac_success:
+                summary_bits.append("RBAC revoked")
+        else:
+            rbac_success = True
+
+        if not (scale_success or rbac_success):
+            overall_status = "failed"
+    except Exception as exc:  # pragma: no cover - defensive
+        overall_status = "failed"
+        step = {
+            "name": "internal_error",
+            "command": "<internal>",
+            "exit_code": 1,
+            "stdout": "",
+            "stderr": str(exc),
+        }
+        steps.append(step)
+        _log_job_step(job_id, step)
+        logger.exception(
+            "Suspend user job failed",
+            extra={"event": "job_failed", "job_id": job_id},
+        )
+
+    summary_text = (
+        f"Suspended {req.username} in namespace {ns}" if overall_status == "succeeded" else f"Failed to suspend {req.username}"
+    )
+    if summary_bits:
+        summary_text = summary_text + " (" + ", ".join(summary_bits) + ")"
+
+    result_payload = {
+        "ok": overall_status == "succeeded",
+        "username": req.username,
+        "namespace": ns,
+        "inputs": {
+            "username": req.username,
+            "namespace": ns,
+            "scale_statefulsets": req.scale_statefulsets,
+            "revoke_rbac": req.revoke_rbac,
+        },
+        "steps": steps,
+        "overall_status": overall_status,
+        "summary": summary_text,
+    }
+
+    await jobs.update(
+        job_id,
+        status=overall_status,
+        finished_at=utcnow_iso(),
+        summary=summary_text,
+        result=result_payload,
+    )
+    logger.info(
+        "job finished",
+        extra={
+            "event": "job_finished",
+            "job_id": job_id,
+            "status": overall_status,
+            "summary": summary_text,
+        },
+    )
+
+
+async def _delete_user_job(job_id: str, req: DeleteUserRequest) -> None:
+    ns = req.namespace or req.username
+    await jobs.update(job_id, status="running", started_at=utcnow_iso())
+    logger.info(
+        "job started",
+        extra={"event": "job_started", "job_id": job_id, "username": req.username, "namespace": ns},
+    )
+
+    steps: list[Dict[str, Any]] = []
+    overall_status = "succeeded"
+    summary_parts: list[str] = []
+    namespace_removed = False
+    account_deleted = not req.delete_account
+
+    try:
+        rm_ns = await run_cmd(["everestctl", "namespaces", "remove", ns], timeout=180)
+        rm_ns.update({"name": "remove_namespace"})
+        steps.append(rm_ns)
+        _log_job_step(job_id, rm_ns)
+        if rm_ns.get("exit_code") == 0:
+            namespace_removed = True
+        else:
+            k8s_del = await run_cmd(
+                [
+                    "kubectl",
+                    "delete",
+                    "namespace",
+                    ns,
+                    "--ignore-not-found=true",
+                    "--wait=false",
+                    "--timeout=30s",
+                ],
+                timeout=60,
+            )
+            k8s_del.update({"name": "delete_namespace"})
+            steps.append(k8s_del)
+            _log_job_step(job_id, k8s_del)
+            namespace_removed = k8s_del.get("exit_code") == 0
+
+        rbac_res = await revoke_user_in_rbac_configmap(req.username, timeout=90)
+        steps.append(rbac_res)
+        _log_job_step(job_id, rbac_res)
+
+        if req.delete_account:
+            del_cmds = [
+                ["everestctl", "accounts", "delete", "-u", req.username],
+                ["everestctl", "accounts", "remove", "-u", req.username],
+            ]
+            for cmd in del_cmds:
+                res = await run_cmd(cmd, timeout=60)
+                res.update({"name": "delete_account"})
+                steps.append(res)
+                _log_job_step(job_id, res)
+                if res.get("exit_code") == 0:
+                    account_deleted = True
+                    break
+
+        if namespace_removed:
+            summary_parts.append(f"namespace {ns} removed")
+        if account_deleted and req.delete_account:
+            summary_parts.append("account deleted")
+        if not namespace_removed or not account_deleted:
+            overall_status = "failed"
+    except Exception as exc:  # pragma: no cover - defensive
+        overall_status = "failed"
+        step = {
+            "name": "internal_error",
+            "command": "<internal>",
+            "exit_code": 1,
+            "stdout": "",
+            "stderr": str(exc),
+        }
+        steps.append(step)
+        _log_job_step(job_id, step)
+        logger.exception(
+            "Delete user job failed",
+            extra={"event": "job_failed", "job_id": job_id},
+        )
+
+    summary_text = (
+        f"Deleted user {req.username} resources" if overall_status == "succeeded" else f"Failed to delete user {req.username}"
+    )
+    if summary_parts:
+        summary_text = summary_text + " (" + ", ".join(summary_parts) + ")"
+
+    result_payload = {
+        "ok": overall_status == "succeeded",
+        "username": req.username,
+        "namespace": ns,
+        "inputs": {
+            "username": req.username,
+            "namespace": ns,
+            "delete_account": req.delete_account,
+        },
+        "steps": steps,
+        "overall_status": overall_status,
+        "summary": summary_text,
+    }
+
+    await jobs.update(
+        job_id,
+        status=overall_status,
+        finished_at=utcnow_iso(),
+        summary=summary_text,
+        result=result_payload,
+    )
+    logger.info(
+        "job finished",
+        extra={
+            "event": "job_finished",
+            "job_id": job_id,
+            "status": overall_status,
+            "summary": summary_text,
+        },
+    )
+
+
+@app.post(
+    "/accounts/password",
+    status_code=status.HTTP_202_ACCEPTED,
+    dependencies=[Depends(require_admin_key)],
+)
+async def set_account_password(req: PasswordChangeRequest, background: BackgroundTasks):
+    job = await jobs.create()
+    logger.info(
+        "job created",
+        extra={"event": "job_created", "job_id": job.job_id, "username": req.username},
+    )
+
+    background.add_task(_set_account_password_job, job.job_id, req)
+    return {"job_id": job.job_id, "status_url": f"/jobs/{job.job_id}"}
+
+
+@app.post(
+    "/namespaces/resources",
+    status_code=status.HTTP_202_ACCEPTED,
+    dependencies=[Depends(require_admin_key)],
+)
+async def update_namespace_resources(req: NamespaceResourceUpdate, background: BackgroundTasks):
+    job = await jobs.create()
+    logger.info(
+        "job created",
+        extra={"event": "job_created", "job_id": job.job_id, "namespace": req.namespace},
+    )
+
+    background.add_task(_update_namespace_resources_job, job.job_id, req)
+    return {"job_id": job.job_id, "status_url": f"/jobs/{job.job_id}"}
+
+
+@app.post(
+    "/namespaces/operators",
+    status_code=status.HTTP_202_ACCEPTED,
+    dependencies=[Depends(require_admin_key)],
+)
+async def update_namespace_operators(req: NamespaceOperatorsUpdate, background: BackgroundTasks):
+    job = await jobs.create()
+    logger.info(
+        "job created",
+        extra={"event": "job_created", "job_id": job.job_id, "namespace": req.namespace},
+    )
+
+    background.add_task(_update_namespace_operators_job, job.job_id, req)
+    return {"job_id": job.job_id, "status_url": f"/jobs/{job.job_id}"}
+
+
+@app.post(
+    "/accounts/suspend",
+    status_code=status.HTTP_202_ACCEPTED,
+    dependencies=[Depends(require_admin_key)],
+)
+async def suspend_user(req: SuspendUserRequest, background: BackgroundTasks):
+    job = await jobs.create()
+    ns = req.namespace or req.username
+    logger.info(
+        "job created",
+        extra={
+            "event": "job_created",
+            "job_id": job.job_id,
+            "username": req.username,
+            "namespace": ns,
+        },
+    )
+
+    background.add_task(_suspend_user_job, job.job_id, req)
+    return {"job_id": job.job_id, "status_url": f"/jobs/{job.job_id}"}
+
+
+@app.post(
+    "/accounts/delete",
+    status_code=status.HTTP_202_ACCEPTED,
+    dependencies=[Depends(require_admin_key)],
+)
+async def delete_user(req: DeleteUserRequest, background: BackgroundTasks):
+    job = await jobs.create()
+    ns = req.namespace or req.username
+    logger.info(
+        "job created",
+        extra={
+            "event": "job_created",
+            "job_id": job.job_id,
+            "username": req.username,
+            "namespace": ns,
+        },
+    )
+
+    background.add_task(_delete_user_job, job.job_id, req)
+    return {"job_id": job.job_id, "status_url": f"/jobs/{job.job_id}"}
 
 
 @app.get("/metrics")
