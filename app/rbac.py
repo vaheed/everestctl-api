@@ -2,7 +2,7 @@ import os
 import json
 import shlex
 import tempfile
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 from .execs import run_cmd
 

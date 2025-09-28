@@ -266,6 +266,10 @@ async def submit_bootstrap(req: BootstrapRequest, background: BackgroundTasks):
         # Track if we generated a password to return it in the result
         generated_password = None
 
+        # Track idempotency outcomes for clear summary wording
+        account_existed = False
+        namespace_existed = False
+
         try:
             # Step 1: Create account (supply password to avoid TTY prompts)
             import secrets
@@ -303,11 +307,16 @@ async def submit_bootstrap(req: BootstrapRequest, background: BackgroundTasks):
                     "stderr_preview": _preview_text(res1.get("stderr")),
                 },
             )
+            # account_existed default set above
             if res1.get("exit_code") != 0:
                 # Idempotency: treat "already exists" as success
                 msg = (res1.get("stderr", "") + res1.get("stdout", "")).lower()
                 if "already exists" in msg or "user exists" in msg or "exists" in msg:
                     res1["exit_code"] = 0
+                    account_existed = True
+                    # Make output less alarming in job result
+                    res1["stdout"] = (res1.get("stdout", "") + ("\n" if res1.get("stdout") else "") + "user already exists; treated as success").strip()
+                    res1["stderr"] = ""
                     logger.info(
                         "step",
                         extra={
@@ -385,11 +394,16 @@ async def submit_bootstrap(req: BootstrapRequest, background: BackgroundTasks):
                         "stderr_preview": _preview_text(res2.get("stderr")),
                     },
                 )
+                # namespace_existed default set above
                 if res2.get("exit_code") != 0:
                     # Idempotency: treat "already exists" equivalents as success
                     msg2 = (res2.get("stderr", "") + res2.get("stdout", "")).lower()
                     if "already exists" in msg2 or "exists" in msg2 or "already present" in msg2:
                         res2["exit_code"] = 0
+                        namespace_existed = True
+                        # Clean up messaging for clarity in result
+                        res2["stdout"] = (res2.get("stdout", "") + ("\n" if res2.get("stdout") else "") + f"namespace '{ns}' already exists; treated as success").strip()
+                        res2["stderr"] = ""
                         logger.info(
                             "step",
                             extra={
@@ -452,10 +466,27 @@ async def submit_bootstrap(req: BootstrapRequest, background: BackgroundTasks):
             )
 
             # Summarize
-            if overall_status == "succeeded" and rbac_step.get("rbac_applied"):
-                summary.append(f"User {req.username} and namespace {ns} created; quota applied; role bound.")
-            elif overall_status == "succeeded":
-                summary.append(f"User {req.username} and namespace {ns} created; quota applied; RBAC skipped.")
+            if overall_status == "succeeded":
+                user_word = "created"
+                ns_word = "created"
+                try:
+                    if account_existed:
+                        user_word = "existed"
+                except NameError:
+                    pass
+                try:
+                    if namespace_existed:
+                        ns_word = "existed"
+                except NameError:
+                    pass
+                if rbac_step.get("rbac_applied"):
+                    summary.append(
+                        f"User {req.username} {user_word}; namespace {ns} {ns_word}; quota applied; role bound."
+                    )
+                else:
+                    summary.append(
+                        f"User {req.username} {user_word}; namespace {ns} {ns_word}; quota applied; RBAC skipped."
+                    )
         except Exception as e:
             overall_status = "failed"
             steps.append({
@@ -601,38 +632,71 @@ async def update_namespace_operators(req: NamespaceOperatorsUpdate):
     """
     Enable database operators for a namespace using everestctl. Supports both
     new (--operator.mysql) and older (--operator.xtradb-cluster) flags.
+
+    Retries transient conflicts up to 3 times with 20s backoff when another
+    operation is in progress before returning 409.
     """
     ops = req.operators
-    new_cli_cmd = [
-        "everestctl",
-        "namespaces",
-        "update",
-        req.namespace,
-        f"--operator.mongodb={'true' if ops.mongodb else 'false'}",
-        f"--operator.postgresql={'true' if ops.postgresql else 'false'}",
-    ]
-    if ops.mysql is not None:
-        new_cli_cmd.append(f"--operator.mysql={'true' if ops.mysql else 'false'}")
-    else:
-        new_cli_cmd.append("--operator.mysql=false")
-    res = await run_cmd(new_cli_cmd, timeout=120)
 
-    # Fallback to older CLI flag if mysql is unknown
-    if res.get("exit_code") != 0 and ("unknown flag" in res.get("stderr", "").lower() or "unknown flag" in res.get("stdout", "").lower()):
-        old_cli_cmd = [
+    async def _attempt_once() -> Dict[str, Any]:
+        new_cli_cmd = [
             "everestctl",
             "namespaces",
             "update",
             req.namespace,
             f"--operator.mongodb={'true' if ops.mongodb else 'false'}",
             f"--operator.postgresql={'true' if ops.postgresql else 'false'}",
-            f"--operator.xtradb-cluster={'true' if ops.xtradb_cluster else 'false'}",
         ]
-        res = await run_cmd(old_cli_cmd, timeout=120)
+        if ops.mysql is not None:
+            new_cli_cmd.append(f"--operator.mysql={'true' if ops.mysql else 'false'}")
+        else:
+            new_cli_cmd.append("--operator.mysql=false")
+        r = await run_cmd(new_cli_cmd, timeout=120)
 
-    if res.get("exit_code") != 0:
-        raise HTTPException(status_code=502, detail={"error": "namespaces update failed", "detail": res.get("stderr", "")[-4000:]})
-    return {"ok": True, "namespace": req.namespace}
+        # Fallback to older CLI flag if mysql is unknown
+        if r.get("exit_code") != 0 and (
+            "unknown flag" in r.get("stderr", "").lower() or "unknown flag" in r.get("stdout", "").lower()
+        ):
+            old_cli_cmd = [
+                "everestctl",
+                "namespaces",
+                "update",
+                req.namespace,
+                f"--operator.mongodb={'true' if ops.mongodb else 'false'}",
+                f"--operator.postgresql={'true' if ops.postgresql else 'false'}",
+                f"--operator.xtradb-cluster={'true' if ops.xtradb_cluster else 'false'}",
+            ]
+            r = await run_cmd(old_cli_cmd, timeout=120)
+        return r
+
+    # Retry up to 3 times on transient "operation in progress" error
+    max_attempts = 3
+    backoff_seconds = 20
+    attempt = 0
+    while True:
+        attempt += 1
+        res = await _attempt_once()
+        if res.get("exit_code") == 0:
+            return {"ok": True, "namespace": req.namespace}
+
+        # Inspect message for known transient conflicts
+        msg = (res.get("stderr", "") + "\n" + res.get("stdout", "")).strip()
+        low = msg.lower()
+        if "another operation" in low and "in progress" in low:
+            if attempt < max_attempts:
+                await asyncio.sleep(backoff_seconds)
+                continue
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "operation in progress",
+                    "detail": msg[-4000:],
+                    "hint": "Another install/upgrade/rollback is running. Retry once it finishes.",
+                },
+                headers={"Retry-After": str(backoff_seconds)},
+            )
+        # Non-transient error
+        raise HTTPException(status_code=502, detail={"error": "namespaces update failed", "detail": msg[-4000:]})
 
 
 @app.post("/accounts/suspend", dependencies=[Depends(require_admin_key)])

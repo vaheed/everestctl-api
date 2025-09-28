@@ -362,3 +362,4 @@ curl -sS -X GET "$BASE_URL/accounts/list" -H "X-Admin-Key: $ADMIN_API_KEY"
 - docker-compose mounts kubeconfig from host and exposes port 8080.
 - CI runs tests then builds & pushes image (deploy optional).
 - README documents setup, usage, and async job flow.
+

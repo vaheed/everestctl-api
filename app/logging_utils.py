@@ -97,7 +97,6 @@ async def correlation_middleware(request, call_next):
         response = await call_next(request)
     finally:
         duration_ms = round((time.perf_counter() - start) * 1000, 2)
-        logger = logging.getLogger("everestctl_api.access")
         # Create a log record with enriched fields (formatter will inject request_id)
         extra = {
             "event": "http_request",

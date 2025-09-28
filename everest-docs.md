@@ -198,7 +198,9 @@ everestctl namespaces add "$NAMESPACE" \
   --operator.postgresql="$POSTGRESQL" \
   --operator.mysql="$MYSQL" \
   || true
+```
 
+```bash
 # Fallback for older everestctl (use one of the two blocks, not both)
 everestctl namespaces add "$NAMESPACE" \
   --operator.mongodb="$MONGODB" \
@@ -278,3 +280,4 @@ EOF
 kubectl apply -n "$NAMESPACE" -f quota-limits.yaml
 kubectl describe resourcequota user-quota -n "$NAMESPACE" || true
 ```
+
