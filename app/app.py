@@ -469,16 +469,10 @@ async def submit_bootstrap(req: BootstrapRequest, background: BackgroundTasks):
             if overall_status == "succeeded":
                 user_word = "created"
                 ns_word = "created"
-                try:
-                    if account_existed:
-                        user_word = "existed"
-                except NameError:
-                    pass
-                try:
-                    if namespace_existed:
-                        ns_word = "existed"
-                except NameError:
-                    pass
+                if account_existed:
+                    user_word = "existed"
+                if namespace_existed:
+                    ns_word = "existed"
                 if rbac_step.get("rbac_applied"):
                     summary.append(
                         f"User {req.username} {user_word}; namespace {ns} {ns_word}; quota applied; role bound."
