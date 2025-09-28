@@ -63,7 +63,10 @@ curl -sS -X POST "$BASE_URL/bootstrap/users" \
   -d '{ "username": "alice" }' | jq
 ```
 
-Response contains a `job_id` and a `status_url`.
+Response contains a `job_id` and a `status_url`. All long-running admin
+operations (bootstrap, password reset, namespace resource/operator updates,
+account suspend/delete) now follow the same pattern: submit work, poll the job
+for status, and fetch the detailed result payload when it completes.
 
 Poll job status
 ```
@@ -103,51 +106,82 @@ List accounts
 curl -sS "$BASE_URL/accounts/list" -H "X-Admin-Key: $ADMIN_API_KEY" | jq
 ```
 
-Change Alice password
+Change Alice password and capture the `job_id`
 ```
-curl -sS -X POST "$BASE_URL/accounts/password" \
+PASS_JOB=$(curl -sS -X POST "$BASE_URL/accounts/password" \
   -H "X-Admin-Key: $ADMIN_API_KEY" -H "Content-Type: application/json" \
-  -d '{ "username": "alice", "new_password": "S3cure!P@ssw0rd" }' | jq
+  -d '{ "username": "alice", "new_password": "S3cure!P@ssw0rd" }' | jq -r .job_id)
+
+until [[ $(curl -sS "$BASE_URL/jobs/$PASS_JOB" -H "X-Admin-Key: $ADMIN_API_KEY" | jq -r .status) =~ ^(succeeded|failed)$ ]]; do
+  sleep 1
+done
+
+curl -sS "$BASE_URL/jobs/$PASS_JOB/result" -H "X-Admin-Key: $ADMIN_API_KEY" | jq
 ```
 
-Update quotas/limits for Alice namespace
+Update quotas/limits for Alice namespace and capture the `job_id`
 ```
-curl -sS -X POST "$BASE_URL/namespaces/resources" \
+RES_JOB=$(curl -sS -X POST "$BASE_URL/namespaces/resources" \
   -H "X-Admin-Key: $ADMIN_API_KEY" -H "Content-Type: application/json" \
   -d '{
         "namespace": "alice",
         "resources": {"cpu_cores": 4, "ram_mb": 4096, "disk_gb": 100, "max_databases": 5}
-      }' | jq
+      }' | jq -r .job_id)
+
+until [[ $(curl -sS "$BASE_URL/jobs/$RES_JOB" -H "X-Admin-Key: $ADMIN_API_KEY" | jq -r .status) =~ ^(succeeded|failed)$ ]]; do
+  sleep 1
+done
+
+curl -sS "$BASE_URL/jobs/$RES_JOB/result" -H "X-Admin-Key: $ADMIN_API_KEY" | jq
 ```
 
-Enable/disable operators for Alice namespace
+Enable/disable operators for Alice namespace and capture the `job_id`
 ```
 # Enable PostgreSQL, disable MongoDB/MySQL
-curl -sS -X POST "$BASE_URL/namespaces/operators" \
+OPS_JOB=$(curl -sS -X POST "$BASE_URL/namespaces/operators" \
   -H "X-Admin-Key: $ADMIN_API_KEY" -H "Content-Type: application/json" \
   -d '{
         "namespace": "alice",
         "operators": {"postgresql": true, "mongodb": false, "mysql": false}
-      }' | jq
+      }' | jq -r .job_id)
+
+until [[ $(curl -sS "$BASE_URL/jobs/$OPS_JOB" -H "X-Admin-Key: $ADMIN_API_KEY" | jq -r .status) =~ ^(succeeded|failed)$ ]]; do
+  sleep 1
+done
+
+curl -sS "$BASE_URL/jobs/$OPS_JOB/result" -H "X-Admin-Key: $ADMIN_API_KEY" | jq
 ```
 
-Suspend Alice (scale down apps, revoke RBAC entry)
+Suspend Alice (scale down apps, revoke RBAC entry) and capture the `job_id`
 ```
-curl -sS -X POST "$BASE_URL/accounts/suspend" \
+SUSPEND_JOB=$(curl -sS -X POST "$BASE_URL/accounts/suspend" \
   -H "X-Admin-Key: $ADMIN_API_KEY" -H "Content-Type: application/json" \
   -d '{
         "username": "alice",
         "namespace": "alice",
         "scale_statefulsets": true,
         "revoke_rbac": true
-      }' | jq
+      }' | jq -r .job_id)
+
+until [[ $(curl -sS "$BASE_URL/jobs/$SUSPEND_JOB" -H "X-Admin-Key: $ADMIN_API_KEY" | jq -r .status) =~ ^(succeeded|failed)$ ]]; do
+  sleep 1
+done
+
+curl -sS "$BASE_URL/jobs/$SUSPEND_JOB/result" -H "X-Admin-Key: $ADMIN_API_KEY" | jq
 ```
 
 ### 3.3 Delete Alice (namespace + account + RBAC cleanup)
+Capture the `job_id` for the delete flow and follow its progress
 ```
-curl -sS -X POST "$BASE_URL/accounts/delete" \
+DELETE_JOB=$(curl -sS -X POST "$BASE_URL/accounts/delete" \
   -H "X-Admin-Key: $ADMIN_API_KEY" -H "Content-Type: application/json" \
-  -d '{ "username": "alice", "namespace": "alice" }' | jq
+  -d '{ "username": "alice", "namespace": "alice" }' | jq -r .job_id)
+
+until [[ $(curl -sS "$BASE_URL/jobs/$DELETE_JOB" -H "X-Admin-Key: $ADMIN_API_KEY" | jq -r .status) =~ ^(succeeded|failed)$ ]]; do
+  sleep 1
+done
+
+curl -sS "$BASE_URL/jobs/$DELETE_JOB/result" -H "X-Admin-Key: $ADMIN_API_KEY" | jq
 ```
 
 Notes
