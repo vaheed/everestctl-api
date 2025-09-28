@@ -303,8 +303,22 @@ async def submit_bootstrap(req: BootstrapRequest, background: BackgroundTasks):
                 },
             )
             if res1.get("exit_code") != 0:
-                overall_status = "failed"
-                summary.append("account creation failed")
+                # Idempotency: treat "already exists" as success
+                msg = (res1.get("stderr", "") + res1.get("stdout", "")).lower()
+                if "already exists" in msg or "user exists" in msg or "exists" in msg:
+                    res1["exit_code"] = 0
+                    logger.info(
+                        "step",
+                        extra={
+                            "event": "job_step_adjusted",
+                            "job_id": job.job_id,
+                            "step_name": "create_account",
+                            "note": "treated as success: already exists",
+                        },
+                    )
+                else:
+                    overall_status = "failed"
+                    summary.append("account creation failed")
 
             # Step 2: Create or take ownership of namespace (attempt newer CLI first)
             if overall_status == "succeeded":
@@ -371,8 +385,22 @@ async def submit_bootstrap(req: BootstrapRequest, background: BackgroundTasks):
                     },
                 )
                 if res2.get("exit_code") != 0:
-                    overall_status = "failed"
-                    summary.append("namespace add failed")
+                    # Idempotency: treat "already exists" equivalents as success
+                    msg2 = (res2.get("stderr", "") + res2.get("stdout", "")).lower()
+                    if "already exists" in msg2 or "exists" in msg2 or "already present" in msg2:
+                        res2["exit_code"] = 0
+                        logger.info(
+                            "step",
+                            extra={
+                                "event": "job_step_adjusted",
+                                "job_id": job.job_id,
+                                "step_name": "add_namespace",
+                                "note": "treated as success: already exists",
+                            },
+                        )
+                    else:
+                        overall_status = "failed"
+                        summary.append("namespace add failed")
 
             # Step 3: Apply ResourceQuota & LimitRange
             if overall_status == "succeeded":
