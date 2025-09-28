@@ -705,7 +705,6 @@ async def suspend_user(req: SuspendUserRequest):
     steps = []
 
     # Step 1: deactivate/disable/suspend account via everestctl (probe support to avoid noise)
-    acct_res = None
     try:
         help_res = await run_cmd(["everestctl", "accounts", "--help"], timeout=10)
         help_text = (help_res.get("stdout", "") + "\n" + help_res.get("stderr", "")).lower()
@@ -730,7 +729,6 @@ async def suspend_user(req: SuspendUserRequest):
             r.update({"name": "deactivate_account"})
             steps.append(r)
             if r.get("exit_code") == 0:
-                acct_res = r
                 break
     # Step 2: scale down DB workloads
     scale_res = None
