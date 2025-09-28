@@ -45,6 +45,7 @@ Notes
 - Container expects kubeconfig mounted at `/root/.kube/config`.
 - To enable RBAC apply, set `EVEREST_RBAC_APPLY_CMD="everestctl access-control import --file {file}"` or point to your tooling. If not set, RBAC step is skipped.
 - Logs are structured JSON and include a request correlation id. Send `X-Request-ID` to propagate your own id; the API also returns `X-Request-ID` on all responses.
+ - If no operators are specified in the request, the API enables a default set to satisfy everestctl (at least one is required). Configure with `BOOTSTRAP_DEFAULT_OPERATORS` (default: `postgresql`). You can also specify explicitly: `{ "username": "alice", "operators": {"postgresql": true} }`.
 
 ## Configuration
 
@@ -52,6 +53,7 @@ Notes
 - `KUBECONFIG`: path to kubeconfig inside the container (default: /root/.kube/config)
 - `EVEREST_RBAC_APPLY_CMD`: optional command template to apply RBAC, with `{file}` placeholder for a temp policy file
 - `BOOTSTRAP_DEFAULT_PASSWORD`: optional default password to use for newly created accounts when not provided in the request. If unset, the API generates a strong random password and returns it in the job result under `credentials`.
+ - `BOOTSTRAP_DEFAULT_OPERATORS`: comma-separated list of operators to enable when the request omits them (choices: `mongodb`, `postgresql`, `mysql`/`xtradb_cluster`). Default: `postgresql`.
 
 ## Endpoints
 

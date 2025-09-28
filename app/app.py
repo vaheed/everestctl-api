@@ -195,18 +195,33 @@ async def submit_bootstrap(req: BootstrapRequest, background: BackgroundTasks):
             # Step 2: Create or take ownership of namespace (attempt newer CLI first)
             if overall_status == "succeeded":
                 operators = req.operators
+                # Determine effective operator selections. If none selected in the
+                # request, fall back to BOOTSTRAP_DEFAULT_OPERATORS env (default: postgresql)
+                def_ops = os.environ.get("BOOTSTRAP_DEFAULT_OPERATORS", "postgresql")
+                def_set = {s.strip().lower() for s in def_ops.split(",") if s.strip()}
+                enable_mongodb = bool(operators.mongodb)
+                enable_postgresql = bool(operators.postgresql)
+                # mysql flag may be None on older/newer CLI; we derive an intent
+                want_mysql_like = (
+                    (operators.mysql is True)
+                    or operators.xtradb_cluster
+                    or ("mysql" in def_set)
+                    or ("xtradb_cluster" in def_set)
+                    or ("xtradb-cluster" in def_set)
+                )
+                # If nothing selected, enable defaults
+                if not any([enable_mongodb, enable_postgresql, want_mysql_like]):
+                    enable_postgresql = True  # safe default
                 new_cli_cmd = [
                     "everestctl",
                     "namespaces",
                     "add",
                     ns,
-                    f"--operator.mongodb={'true' if operators.mongodb else 'false'}",
-                    f"--operator.postgresql={'true' if operators.postgresql else 'false'}",
+                    f"--operator.mongodb={'true' if enable_mongodb else 'false'}",
+                    f"--operator.postgresql={'true' if enable_postgresql else 'false'}",
                 ]
-                if operators.mysql is not None:
-                    new_cli_cmd.append(f"--operator.mysql={'true' if operators.mysql else 'false'}")
-                else:
-                    new_cli_cmd.append("--operator.mysql=false")
+                # Prefer new mysql flag; fallback to xtradb in case of unknown flag
+                new_cli_cmd.append(f"--operator.mysql={'true' if want_mysql_like else 'false'}")
                 if req.take_ownership:
                     new_cli_cmd.append("--take-ownership")
 
@@ -219,9 +234,9 @@ async def submit_bootstrap(req: BootstrapRequest, background: BackgroundTasks):
                         "namespaces",
                         "add",
                         ns,
-                        f"--operator.mongodb={'true' if operators.mongodb else 'false'}",
-                        f"--operator.postgresql={'true' if operators.postgresql else 'false'}",
-                        f"--operator.xtradb-cluster={'true' if operators.xtradb_cluster else 'false'}",
+                        f"--operator.mongodb={'true' if enable_mongodb else 'false'}",
+                        f"--operator.postgresql={'true' if enable_postgresql else 'false'}",
+                        f"--operator.xtradb-cluster={'true' if want_mysql_like else 'false'}",
                     ]
                     if req.take_ownership:
                         old_cli_cmd.append("--take-ownership")
